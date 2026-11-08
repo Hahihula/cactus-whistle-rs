@@ -4,7 +4,7 @@
 //! its duration to a counter. The first [`PHASES`] counters are the pipeline
 //! stages, the rest break them down and overlap them.
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 pub const MEL: usize = 0;
 pub const STEM: usize = 1;
@@ -26,26 +26,43 @@ pub const MIX: usize = 16;
 pub const PREP: usize = 17;
 pub const COUNT: usize = 18;
 pub const PHASES: usize = 5;
-pub const NAMES: [&str; COUNT] =
-    ["mel", "stem", "encoder", "cross_kv", "decoder", "~matmul", "~mlp", "~attn", "~mhc", "~head", "~engram",
-     "~conv", "~silu", "~kron", "~mlp_load", "~sinkhorn", "~mix", "~q8_prep"];
+pub const NAMES: [&str; COUNT] = [
+    "mel",
+    "stem",
+    "encoder",
+    "cross_kv",
+    "decoder",
+    "~matmul",
+    "~mlp",
+    "~attn",
+    "~mhc",
+    "~head",
+    "~engram",
+    "~conv",
+    "~silu",
+    "~kron",
+    "~mlp_load",
+    "~sinkhorn",
+    "~mix",
+    "~q8_prep",
+];
 
-static CLOCK: AtomicUsize = AtomicUsize::new(0);
+static CLOCK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static US: [AtomicU32; COUNT] = [const { AtomicU32::new(0) }; COUNT];
 
 /// Install a free-running microsecond clock (wrapping is fine).
 pub fn set_clock(f: fn() -> u32) {
-    CLOCK.store(f as usize, Ordering::Relaxed);
+    CLOCK.store(f as *mut (), Ordering::Relaxed);
 }
 
 #[inline]
 fn now() -> Option<u32> {
     let f = CLOCK.load(Ordering::Relaxed);
-    if f == 0 {
+    if f.is_null() {
         return None;
     }
     // SAFETY: only ever stored from a `fn() -> u32` in set_clock.
-    let f: fn() -> u32 = unsafe { core::mem::transmute(f) };
+    let f = unsafe { core::mem::transmute::<*mut (), fn() -> u32>(f) };
     Some(f())
 }
 

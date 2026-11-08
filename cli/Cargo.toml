@@ -9,7 +9,11 @@ repository.workspace   = true
 publish      = false
 
 [dependencies]
-cactus-whistle = { path = "../whistle" }
+cactus-whistle = { path = "../whistle", features = ["std"] }
+# Desktop only: decoding audio files of any common format, microphone input.
+symphonia = { version = "0.6", default-features = false, features = ["mp3", "ogg", "vorbis", "flac", "wav", "pcm", "aac", "isomp4"] }
+cpal = "0.18"
+libm = "0.2"
 
 [[bin]]
 name = "whistle"

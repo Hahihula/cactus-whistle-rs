@@ -13,15 +13,15 @@
 //! checked tensor by tensor against the official engine. Function names and
 //! evaluation order follow the C code so the two can be diffed directly.
 
-use alloc::vec;
-use alloc::vec::Vec;
 use alloc::rc::Rc;
 use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 
-use crate::cact::{rd_u32, Cact, CactError, Tensor, DT_CQ, DT_FP16, DT_FP32, DT_RAW};
+use crate::cact::{Cact, CactError, DT_CQ, DT_FP16, DT_FP32, DT_RAW, Tensor, rd_u32};
 use crate::math::{expf, f16, fma, logf, rms_unit, sigm, silu, softmax, sqrtf};
-use crate::quant::{dequant_row, q8_gemm, q8_ok, Q8Act};
 use crate::prof;
+use crate::quant::{Q8Act, dequant_row, q8_gemm, q8_ok};
 use crate::tokenizer::Tokenizer;
 
 pub const LANGS: [&str; 7] = ["en", "de", "fr", "es", "it", "nl", "pl"];
@@ -185,6 +185,35 @@ impl From<CactError> for Error {
     }
 }
 
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::Cact(e) => write!(f, "invalid .cact file: {e}"),
+            Error::NotV4Whistle => {
+                f.write_str("not a Whistle model (.cact v4 with the audio tensors)")
+            }
+            Error::Unsupported => {
+                f.write_str("model uses a configuration this engine doesn't support")
+            }
+            Error::Layout => f.write_str("model tensors don't have the expected shapes"),
+            Error::Tokenizer => f.write_str("model's tokenizer tensor is invalid"),
+            Error::BadDepth => {
+                f.write_str("decoder depth must be between 2 and the model's layer count")
+            }
+            Error::ClipTooShort => f.write_str("audio too short to transcribe"),
+        }
+    }
+}
+
+impl core::error::Error for Error {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Error::Cact(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 /// Hadamard MLP weights, expanded from fp16 once per call.
 struct MlpW {
     a: [[f32; 256]; 3],
@@ -210,8 +239,8 @@ pub struct Session {
     // positions used so far, not all max_seq (~1.2 MB for 4 layers).
     k_cache: Vec<Vec<f32>>, // [layer][pos][nkv*qk]
     v_cache: Vec<Vec<f32>>, // [layer][pos][nkv*vd]
-    qkv_hist: Vec<f32>, // [layer][taps-1][q|k|v raw]
-    eg_hist: Vec<f32>,  // [site][EG_HIST][d]
+    qkv_hist: Vec<f32>,     // [layer][taps-1][q|k|v raw]
+    eg_hist: Vec<f32>,      // [site][EG_HIST][d]
     hist: [u32; 8],
     sc: Vec<f32>,
 }
@@ -553,7 +582,10 @@ impl<'a> Whistle<'a> {
                 let _mx = prof::span(prof::MIX);
                 for j in 0..n {
                     let off = if j == hot { 0.0 } else { -4.0 };
-                    let hp = 2.0 * sigm(a_post * post[t * n + j] + self.hv(mhc + H_B_POST, layer * n + j) + off);
+                    let hp = 2.0
+                        * sigm(
+                            a_post * post[t * n + j] + self.hv(mhc + H_B_POST, layer * n + j) + off,
+                        );
                     for c in 0..d {
                         let mut s = 0f32;
                         for k in 0..n {
@@ -631,16 +663,28 @@ impl<'a> Whistle<'a> {
         let fb = self.p[self.i_melfb];
         let mut out = vec![0f32; m_frames * mels];
         let blog = self.front_blog;
-        let gain = if blog { level_gain_blog(x) } else { peak_gain(x) };
+        let gain = if blog {
+            level_gain_blog(x)
+        } else {
+            peak_gain(x)
+        };
         let hann = if blog { &self.hann_sym } else { &self.hann };
-        let (log_eps, norm_eps) = if blog { (LOG_EPS_BLOG, NORM_EPS_BLOG) } else { (LOG_EPS, NORM_EPS) };
+        let (log_eps, norm_eps) = if blog {
+            (LOG_EPS_BLOG, NORM_EPS_BLOG)
+        } else {
+            (LOG_EPS, NORM_EPS)
+        };
         let mut re = [0f32; 512];
         let mut im = [0f32; 512];
         let mut pw = [0f32; 257];
         for t in 0..m_frames {
             for k in 0..self.n_fft {
                 let s = (t * self.hop + k) as isize - (self.n_fft / 2) as isize;
-                re[k] = if s >= 0 && (s as usize) < n { sample(x[s as usize], blog) * gain * hann[k] } else { 0.0 };
+                re[k] = if s >= 0 && (s as usize) < n {
+                    sample(x[s as usize], blog) * gain * hann[k]
+                } else {
+                    0.0
+                };
                 im[k] = 0.0;
             }
             self.fft512(&mut re, &mut im);
@@ -667,7 +711,11 @@ impl<'a> Whistle<'a> {
                 let dd = out[t * mels + b] - s;
                 q += dd * dd;
             }
-            let sd = if m_frames > 1 { sqrtf(q / (m_frames - 1) as f32) } else { 0.0 };
+            let sd = if m_frames > 1 {
+                sqrtf(q / (m_frames - 1) as f32)
+            } else {
+                0.0
+            };
             for t in 0..m_frames {
                 out[t * mels + b] = (out[t * mels + b] - s) / (sd + norm_eps);
             }
@@ -839,7 +887,11 @@ impl<'a> Whistle<'a> {
         self.mlp_residual(x, rows, l + E_PRE_HADA0, l + E_MLP0, 0.5);
 
         for t in 0..rows {
-            self.zc(&x[t * d..(t + 1) * d], l + E_NORM_IN, &mut xn[t * d..(t + 1) * d]);
+            self.zc(
+                &x[t * d..(t + 1) * d],
+                l + E_NORM_IN,
+                &mut xn[t * d..(t + 1) * d],
+            );
         }
         self.enc_attention(l, &xn, rows, &mut o);
         let gate = sigm(self.hv(l + E_AGATE, 0));
@@ -852,7 +904,11 @@ impl<'a> Whistle<'a> {
 
         // Conv module: pw1 -> GLU -> 9-tap depthwise -> norm -> SiLU -> pw2.
         for t in 0..rows {
-            self.zc(&x[t * d..(t + 1) * d], l + E_CONV_NORM, &mut xn[t * d..(t + 1) * d]);
+            self.zc(
+                &x[t * d..(t + 1) * d],
+                l + E_CONV_NORM,
+                &mut xn[t * d..(t + 1) * d],
+            );
         }
         let o = self.lin(l + E_PW1, &xn, rows); // [T][2d]
         for t in 0..rows {
@@ -913,9 +969,14 @@ impl<'a> Whistle<'a> {
         lanes_init(&s, t, n, d, &mut lanes);
         drop(s);
         for i in 0..self.enc_layers {
-            self.mhc_step(self.i_enc_mhc, i, i, &mut lanes, t, &mut |w, layer, u, rows| {
-                w.enc_block(layer, u, rows)
-            });
+            self.mhc_step(
+                self.i_enc_mhc,
+                i,
+                i,
+                &mut lanes,
+                t,
+                &mut |w, layer, u, rows| w.enc_block(layer, u, rows),
+            );
         }
         let mut out = vec![0f32; t * d];
         self.lanes_out(&lanes, t, self.i_enc_final, &mut out);
@@ -928,12 +989,23 @@ impl<'a> Whistle<'a> {
     /// hash over its own token history and the taps over its own value
     /// history; the key/value projections run as one batched matmul.
     /// `ek`/`ev` hold [beam][site][512].
-    fn engram_batch(&self, toks: &[u32], pos: usize, ss: &mut [Session], ek: &mut [f32], ev: &mut [f32]) {
+    fn engram_batch(
+        &self,
+        toks: &[u32],
+        pos: usize,
+        ss: &mut [Session],
+        ek: &mut [f32],
+        ev: &mut [f32],
+    ) {
         let _s = prof::span(prof::ENGRAM);
         let bsz = ss.len();
         let h = &self.c.h;
         let heads = (h.engram_tables / h.num_orders) as usize;
-        let stride = if h.engram_seed_heads != 0 { h.engram_seed_heads as usize } else { heads };
+        let stride = if h.engram_seed_heads != 0 {
+            h.engram_seed_heads as usize
+        } else {
+            heads
+        };
         let sub = h.engram_sub_dim as usize;
         let ntab = h.engram_tables as usize;
         let slots = h.engram_slots as usize;
@@ -970,7 +1042,14 @@ impl<'a> Whistle<'a> {
                 for tt in 0..ntab {
                     let dst = &mut e[b * inn + tt * sub..b * inn + (tt + 1) * sub];
                     if ok[b][tt] {
-                        dequant_row(&self.c, tt_t, self.p[g + G_TABLES], tt * slots + slot[b][tt], &mut row, dst);
+                        dequant_row(
+                            &self.c,
+                            tt_t,
+                            self.p[g + G_TABLES],
+                            tt * slots + slot[b][tt],
+                            &mut row,
+                            dst,
+                        );
                     } else {
                         dst.fill(0.0);
                     }
@@ -1006,7 +1085,15 @@ impl<'a> Whistle<'a> {
     /// beam. Each row is quantised and dotted on its own, so a beam's result
     /// is bit-identical to running it alone.
     #[allow(clippy::too_many_arguments)]
-    fn dec_block_batch(&self, layer: usize, x: &mut [f32], ss: &mut [Session], pos: usize, ek: &[f32], ev: &[f32]) {
+    fn dec_block_batch(
+        &self,
+        layer: usize,
+        x: &mut [f32],
+        ss: &mut [Session],
+        pos: usize,
+        ek: &[f32],
+        ev: &[f32],
+    ) {
         let bsz = ss.len();
         let l = self.i_dec + layer * D_N;
         let xi = self.i_cross + layer * X_N;
@@ -1055,13 +1142,21 @@ impl<'a> Whistle<'a> {
         // Self attention with a causal 3-tap conv on Q, K, V.
         let mut xn = vec![0f32; bsz * d];
         for b in 0..bsz {
-            self.zc(&x[b * d..(b + 1) * d], l + D_NORM_IN, &mut xn[b * d..(b + 1) * d]);
+            self.zc(
+                &x[b * d..(b + 1) * d],
+                l + D_NORM_IN,
+                &mut xn[b * d..(b + 1) * d],
+            );
         }
         let mut raw = vec![0f32; bsz * nraw];
         let mut gt = vec![0f32; bsz * no];
         {
             let a = self.act(l + D_Q, &xn, bsz);
-            let (mut tq, mut tk, mut tv) = (vec![0f32; bsz * nq], vec![0f32; bsz * nk], vec![0f32; bsz * nv]);
+            let (mut tq, mut tk, mut tv) = (
+                vec![0f32; bsz * nq],
+                vec![0f32; bsz * nk],
+                vec![0f32; bsz * nv],
+            );
             self.gemm(l + D_Q, &a, &mut tq);
             self.gemm(l + D_K, &a, &mut tk);
             self.gemm(l + D_V, &a, &mut tv);
@@ -1090,7 +1185,8 @@ impl<'a> Whistle<'a> {
                 let mut acc = self.hv(ti, ci) * rawb[e];
                 for j in 1..self.taps {
                     if pos >= j {
-                        acc += self.hv(ti, j * width + ci) * s.qkv_hist[hist0 + ((pos - j) % (self.taps - 1)) * nraw + e];
+                        acc += self.hv(ti, j * width + ci)
+                            * s.qkv_hist[hist0 + ((pos - j) % (self.taps - 1)) * nraw + e];
                     }
                 }
                 conv[e] = acc;
@@ -1099,11 +1195,19 @@ impl<'a> Whistle<'a> {
             s.qkv_hist[hp..hp + nraw].copy_from_slice(&rawb[..nraw]);
             rawb.copy_from_slice(&conv[..nraw]);
             for h in 0..nh {
-                self.zc(&rawb[h * qk..(h + 1) * qk], l + D_QN, &mut q[h * qk..(h + 1) * qk]);
+                self.zc(
+                    &rawb[h * qk..(h + 1) * qk],
+                    l + D_QN,
+                    &mut q[h * qk..(h + 1) * qk],
+                );
                 self.rope(&mut q[h * qk..(h + 1) * qk], pos);
             }
             for h in 0..nkv {
-                self.zc(&rawb[nq + h * qk..nq + (h + 1) * qk], l + D_KN, &mut tmp[..qk]);
+                self.zc(
+                    &rawb[nq + h * qk..nq + (h + 1) * qk],
+                    l + D_KN,
+                    &mut tmp[..qk],
+                );
                 self.rope(&mut tmp[..qk], pos);
                 let kc = pos * nk + h * qk;
                 s.k_cache[layer][kc..kc + qk].copy_from_slice(&tmp[..qk]);
@@ -1148,7 +1252,11 @@ impl<'a> Whistle<'a> {
         // Gated cross attention over the clip (K, V precomputed per layer,
         // shared by every beam).
         for b in 0..bsz {
-            self.zc(&x[b * d..(b + 1) * d], xi + X_NORM, &mut xn[b * d..(b + 1) * d]);
+            self.zc(
+                &x[b * d..(b + 1) * d],
+                xi + X_NORM,
+                &mut xn[b * d..(b + 1) * d],
+            );
         }
         let mut cq = vec![0f32; bsz * nq];
         {
@@ -1163,7 +1271,11 @@ impl<'a> Whistle<'a> {
             for h in 0..nh {
                 let k0 = (layer * nh + h) * et * qk;
                 let v0 = (layer * nh + h) * et * vd;
-                self.zc(&cq[b * nq + h * qk..b * nq + (h + 1) * qk], xi + X_QN, &mut tmp[..qk]);
+                self.zc(
+                    &cq[b * nq + h * qk..b * nq + (h + 1) * qk],
+                    xi + X_QN,
+                    &mut tmp[..qk],
+                );
                 for si in 0..et {
                     let mut acc = 0f32;
                     for e in 0..qk {
@@ -1280,7 +1392,14 @@ impl<'a> Whistle<'a> {
         let sd = sqrtf(d as f32);
         for b in 0..bsz {
             let xb = &mut x[b * d..(b + 1) * d];
-            dequant_row(&self.c, e, self.p[self.i_emb], toks[b] as usize, &mut row, xb);
+            dequant_row(
+                &self.c,
+                e,
+                self.p[self.i_emb],
+                toks[b] as usize,
+                &mut row,
+                xb,
+            );
             for v in xb.iter_mut() {
                 *v *= sd;
             }
@@ -1291,9 +1410,14 @@ impl<'a> Whistle<'a> {
         let mut lanes = vec![0f32; bsz * self.lanes * d];
         lanes_init(&x, bsz, self.lanes, d, &mut lanes);
         for i in 0..self.depth {
-            self.mhc_step(self.i_dec_mhc, self.active[i], i, &mut lanes, bsz, &mut |w, layer, u, _| {
-                w.dec_block_batch(layer, u, ss, pos, &ek, &ev)
-            });
+            self.mhc_step(
+                self.i_dec_mhc,
+                self.active[i],
+                i,
+                &mut lanes,
+                bsz,
+                &mut |w, layer, u, _| w.dec_block_batch(layer, u, ss, pos, &ek, &ev),
+            );
         }
         let mut hid = vec![0f32; bsz * d];
         self.lanes_out(&lanes, bsz, self.i_dec_final, &mut hid);
@@ -1312,7 +1436,13 @@ impl<'a> Whistle<'a> {
     }
 
     /// One greedy pass in `lang` from BOS. Returns ids and the mean log-prob.
-    fn decode_pass(&self, lang: usize, s: &mut Session, cap: usize, budget: usize) -> (Vec<u32>, f32) {
+    fn decode_pass(
+        &self,
+        lang: usize,
+        s: &mut Session,
+        cap: usize,
+        budget: usize,
+    ) -> (Vec<u32>, f32) {
         let mut ids: Vec<u32> = Vec::new();
         let mut sum = 0f32;
         let mut pos = 0usize;
@@ -1368,11 +1498,17 @@ impl<'a> Whistle<'a> {
             None => {
                 let hid = self.dec_step(BOS_ID, 0, &mut s);
                 let lg = self.logits(&hid);
-                let mask = if self.lang_mask != 0 { self.lang_mask } else { 0x7F };
+                let mask = if self.lang_mask != 0 {
+                    self.lang_mask
+                } else {
+                    0x7F
+                };
                 let mut best: Option<usize> = None;
                 for k in 0..N_LANGS {
                     self.lang_logit[k] = lg[LANG_BASE as usize + k];
-                    if mask & (1 << k) != 0 && best.is_none_or(|b| self.lang_logit[k] > self.lang_logit[b]) {
+                    if mask & (1 << k) != 0
+                        && best.is_none_or(|b| self.lang_logit[k] > self.lang_logit[b])
+                    {
                         best = Some(k);
                     }
                 }
@@ -1407,19 +1543,27 @@ impl<'a> Whistle<'a> {
         let nb = self.beams;
         let vocab = self.vocab;
         self.dec_step(BOS_ID, 0, s0);
-        let mut live = vec![Beam { s: s0.clone(), toks: Vec::new(), score: 0.0, next: LANG_BASE + lang as u32 }];
+        let mut live = vec![Beam {
+            s: s0.clone(),
+            toks: Vec::new(),
+            score: 0.0,
+            next: LANG_BASE + lang as u32,
+        }];
         let mut done: Vec<(f32, Vec<u32>)> = Vec::new();
         let mut pos = 1;
         while !live.is_empty() && done.len() < nb && pos < self.max_seq {
             // All live beams through the decoder at once.
             let toks: Vec<u32> = live.iter().map(|b| b.next).collect();
-            let mut ss: Vec<Session> = live.iter_mut().map(|b| core::mem::replace(&mut b.s, s0.clone_empty())).collect();
+            let mut ss: Vec<Session> = live
+                .iter_mut()
+                .map(|b| core::mem::replace(&mut b.s, s0.clone_empty()))
+                .collect();
             let hid = self.dec_step_batch(&toks, pos, &mut ss);
             let lg = self.logits_batch(&hid, live.len());
             for (b, s) in live.iter_mut().zip(ss) {
                 b.s = s;
             }
-            let mut props: Vec<(f32, usize, u32)> = Vec::new();
+            let mut props: Vec<(f32, usize, u32)> = Vec::with_capacity(live.len() * BEAM_PROPOSALS);
             for (bi, b) in live.iter().enumerate() {
                 let text = &lg[bi * vocab..bi * vocab + LANG_BASE as usize];
                 let mut mx = text[0];
@@ -1431,7 +1575,8 @@ impl<'a> Whistle<'a> {
                     se += expf(v - mx);
                 }
                 let lse = mx + logf(se);
-                for k in top_k(text, BEAM_PROPOSALS) {
+                let (best, n) = top_k::<BEAM_PROPOSALS>(text);
+                for &k in &best[..n] {
                     props.push((b.score + text[k] - lse, bi, k as u32));
                 }
             }
@@ -1460,13 +1605,21 @@ impl<'a> Whistle<'a> {
                     done.push((score / n as f32, toks));
                     continue;
                 }
-                next.push(Beam { s: parent.s.clone(), toks, score, next: tok });
+                next.push(Beam {
+                    s: parent.s.clone(),
+                    toks,
+                    score,
+                    next: tok,
+                });
             }
             live = next;
         }
         let best = done
             .into_iter()
-            .chain(live.into_iter().map(|b| (b.score / (b.toks.len().max(1)) as f32, b.toks)))
+            .chain(
+                live.into_iter()
+                    .map(|b| (b.score / (b.toks.len().max(1)) as f32, b.toks)),
+            )
             .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
         match best {
             Some((score, toks)) => (toks, score),
@@ -1531,7 +1684,9 @@ impl<'a> Whistle<'a> {
         let mut p = Vec::with_capacity(nt);
         for i in 0..nt {
             let ti = c.tensor(i as u32)?;
-            let data = c.data(&ti).ok_or(Error::Cact(CactError::BadRecord(i as u32)))?;
+            let data = c
+                .data(&ti)
+                .ok_or(Error::Cact(CactError::BadRecord(i as u32)))?;
             if ti.dtype == DT_CQ && !q8_ok(&ti) {
                 return Err(Error::Unsupported);
             }
@@ -1539,8 +1694,12 @@ impl<'a> Whistle<'a> {
             p.push(data);
         }
         let d = h.d_model as usize;
-        let (nh, nkv, qk, vd) =
-            (h.num_heads as usize, h.num_kv_heads as usize, h.qk_head_dim as usize, h.v_head_dim as usize);
+        let (nh, nkv, qk, vd) = (
+            h.num_heads as usize,
+            h.num_kv_heads as usize,
+            h.qk_head_dim as usize,
+            h.v_head_dim as usize,
+        );
         let lanes = h.mhc_lanes as usize;
         let taps = h.qkv_conv_taps as usize;
         let dec_layers = h.num_layers as usize;
@@ -1618,7 +1777,11 @@ impl<'a> Whistle<'a> {
                 // SAFETY: any bit pattern is a valid u16; only taken when the
                 // payload is 2-byte aligned (cact payloads are 64-byte aligned).
                 let (pre, mid, _) = unsafe { b.align_to::<u16>() };
-                if ti.dtype == DT_FP16 && pre.is_empty() { mid } else { &[][..] }
+                if ti.dtype == DT_FP16 && pre.is_empty() {
+                    mid
+                } else {
+                    &[][..]
+                }
             })
             .collect();
 
@@ -1935,16 +2098,19 @@ fn conv_rows(
 }
 
 /// The `k` largest entries of `x`, best first.
-fn top_k(x: &[f32], k: usize) -> Vec<usize> {
-    let mut best: Vec<usize> = Vec::with_capacity(k + 1);
+fn top_k<const K: usize>(x: &[f32]) -> ([usize; K], usize) {
+    // A sorted array, largest first; ties keep the lower index first.
+    let mut best = [0usize; K];
+    let mut n = 0;
     for (i, &v) in x.iter().enumerate() {
-        if best.len() < k || v > x[best[best.len() - 1]] {
-            let at = best.iter().position(|&j| v > x[j]).unwrap_or(best.len());
-            best.insert(at, i);
-            best.truncate(k);
+        if n < K || v > x[best[n - 1]] {
+            let at = best[..n].iter().position(|&j| v > x[j]).unwrap_or(n);
+            n = (n + 1).min(K);
+            best.copy_within(at..n - 1, at + 1);
+            best[at] = i;
         }
     }
-    best
+    (best, n)
 }
 
 /// The guide's loop rule for the beam: the same unit of up to eight tokens
@@ -1976,7 +2142,12 @@ fn tail_loop(ids: &[u32]) -> usize {
 /// Find the speech in a clip: 20 ms windows whose RMS is `min_db` over the
 /// noise floor (`floor_rms`, or the 10th-percentile window when <= 0).
 /// Returns the sample range with `margin_ms` either side, or None for silence.
-pub fn find_speech(x: &[f32], mut floor_rms: f32, min_db: f32, margin_ms: usize) -> Option<(usize, usize)> {
+pub fn find_speech(
+    x: &[f32],
+    mut floor_rms: f32,
+    min_db: f32,
+    margin_ms: usize,
+) -> Option<(usize, usize)> {
     const W: usize = 320;
     let n = x.len();
     let nw = n / W;
@@ -2012,4 +2183,41 @@ pub fn find_speech(x: &[f32], mut floor_rms: f32, min_db: f32, margin_ms: usize)
     let s0 = (first * W).saturating_sub(m);
     let s1 = ((last + 1) * W + m).min(n);
     Some((s0, s1))
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use std::vec::Vec;
+
+    use super::top_k;
+
+    /// The insertion-sort version top_k replaced.
+    fn reference(x: &[f32], k: usize) -> Vec<usize> {
+        let mut best: Vec<usize> = Vec::new();
+        for (i, &v) in x.iter().enumerate() {
+            if best.len() < k || v > x[best[best.len() - 1]] {
+                let at = best.iter().position(|&j| v > x[j]).unwrap_or(best.len());
+                best.insert(at, i);
+                best.truncate(k);
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn top_k_matches_the_reference() {
+        let mut seed = 12345u32;
+        for len in [1usize, 3, 6, 7, 50, 8199] {
+            let x: Vec<f32> = (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    // Few distinct values, so ties are common.
+                    (seed >> 28) as f32
+                })
+                .collect();
+            let (best, n) = top_k::<6>(&x);
+            assert_eq!(&best[..n], &reference(&x, 6)[..], "len {len}");
+        }
+    }
 }

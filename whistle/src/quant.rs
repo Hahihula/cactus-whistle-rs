@@ -40,7 +40,10 @@ pub struct AlignedI8 {
 
 impl AlignedI8 {
     pub fn zeroed(len: usize) -> Self {
-        AlignedI8 { buf: vec![A16([0; 16]); len.div_ceil(16)], len }
+        AlignedI8 {
+            buf: vec![A16([0; 16]); len.div_ceil(16)],
+            len,
+        }
     }
     #[inline]
     pub fn as_slice(&self) -> &[i8] {
@@ -70,7 +73,8 @@ pub struct Kernel {
     /// The engine guarantees: `w` has `128 * groups` and `x` has
     /// `128 * groups * rows` readable bytes, both 16-byte aligned, and the
     /// call happens on a thread where [`Kernel::here`] returned `true`.
-    pub dot_rows: unsafe fn(w: *const i8, x: *const i8, groups: usize, rows: usize, out: &mut [i32]),
+    pub dot_rows:
+        unsafe fn(w: *const i8, x: *const i8, groups: usize, rows: usize, out: &mut [i32]),
     /// Whether `dot_rows` can run on the calling thread or core (on chips
     /// where only some cores have the vector unit). Asked once per batch of
     /// rows; where it says no, the engine uses its portable loop.
@@ -83,6 +87,10 @@ static HERE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 /// Installs a dot-product kernel for all following matmuls (`None`: back to
 /// the portable loop). Set it before opening the model, on the core that
 /// will run it; it applies to every thread.
+///
+/// Process-wide on purpose: a kernel describes the hardware (which cores have
+/// a vector unit), not a model, and every kernel must give the same results
+/// as the portable loop, so two models sharing it can't affect each other.
 pub fn set_kernel(kernel: Option<Kernel>) {
     match kernel {
         Some(k) => {
@@ -103,7 +111,10 @@ pub fn kernel() -> Option<Kernel> {
     // exactly these types (HERE before DOT_ROWS, so HERE is set too).
     unsafe {
         Some(Kernel {
-            dot_rows: core::mem::transmute::<*mut (), unsafe fn(*const i8, *const i8, usize, usize, &mut [i32])>(dot),
+            dot_rows: core::mem::transmute::<
+                *mut (),
+                unsafe fn(*const i8, *const i8, usize, usize, &mut [i32]),
+            >(dot),
             here: core::mem::transmute::<*mut (), fn() -> bool>(HERE.load(Ordering::Acquire)),
         })
     }
@@ -166,14 +177,17 @@ pub fn q8(v: f32) -> i8 {
     (v + if v >= 0.0 { 0.5 } else { -0.5 }) as i32 as i8
 }
 
-/// [`q8`] for values known to lie within +-127.5 (a group scaled by 127 /
-/// its max): the same result without the saturating cast's range checks,
-/// which cost more than the rest of the loop on the LX7.
+/// [`q8`] for values known to lie within +-127.5: the same result without
+/// the saturating cast's range checks, which cost more than the rest of the
+/// loop on an Xtensa LX7.
+///
+/// The only caller scales a group by 127 / its largest magnitude after
+/// checking that magnitude is finite, so `|v| <= 127 * (1 + epsilon)`.
 #[inline(always)]
 fn q8_bounded(v: f32) -> i8 {
     let r = v + if v >= 0.0 { 0.5 } else { -0.5 };
     debug_assert!(r.abs() < 128.5);
-    // SAFETY: |v| <= 127 * (1 + epsilon), so r is finite and inside i32.
+    // SAFETY: r is finite and within +-127.5 (see above), so inside i32.
     unsafe { r.to_int_unchecked::<i32>() as i8 }
 }
 
@@ -185,8 +199,8 @@ pub fn q8_ok(t: &Tensor) -> bool {
 /// T activation rows in the Hadamard domain as int8, one scale per 128-group.
 /// Prepare once and run every tensor that reduces over the same input.
 pub struct Q8Act {
-    pub xq: AlignedI8,   // [T][in_pad]
-    pub sx: Vec<f32>,    // [T][in_pad / 128]
+    pub xq: AlignedI8, // [T][in_pad]
+    pub sx: Vec<f32>,  // [T][in_pad / 128]
     pub t: usize,
     pub in_pad: usize,
 }
@@ -224,16 +238,28 @@ impl Q8Act {
                     blk[..n].copy_from_slice(&src[col0..col0 + n]);
                     blk[n..].fill(0.0);
                     crate::math::fwht128(&mut blk);
-                    let mut m = 0f32;
+                    // The largest magnitude, as an integer max over the bits
+                    // of |v|: for non-negative floats the bit patterns order
+                    // like the values, and NaN and infinity sort above every
+                    // finite value, so the check below catches them too.
+                    let mut m_bits = 0u32;
                     for v in blk.iter_mut() {
                         *v *= INV_SQRT_128;
-                        let a = v.abs();
-                        m = if a > m { a } else { m };
+                        m_bits = m_bits.max(v.to_bits() & 0x7FFF_FFFF);
+                    }
+                    let m = f32::from_bits(m_bits);
+                    // SAFETY: group g of row k belongs to this work item.
+                    let qg = unsafe { qp.group(k * in_pad + g * 128) };
+                    if !m.is_finite() {
+                        // NaN or infinity in the activations (broken input):
+                        // a zero group, so q8_bounded only ever sees values
+                        // within +-127.5.
+                        qg.fill(0);
+                        unsafe { sp.write(k * ng + g, 1.0) };
+                        continue;
                     }
                     let s = if m > 0.0 { m / 127.0 } else { 1.0 };
                     let inv = 1.0 / s;
-                    // SAFETY: group g of row k belongs to this work item.
-                    let qg = unsafe { qp.group(k * in_pad + g * 128) };
                     for j in 0..128 {
                         qg[j] = q8_bounded(blk[j] * inv);
                     }
@@ -242,7 +268,12 @@ impl Q8Act {
             }
         };
         crate::par::rows(rows, 1, &kernel);
-        Q8Act { xq, sx, t: rows, in_pad }
+        Q8Act {
+            xq,
+            sx,
+            t: rows,
+            in_pad,
+        }
     }
 }
 
@@ -254,7 +285,15 @@ fn norm_at(blob: &[u8], norms_off: usize, idx: usize) -> f32 {
 }
 
 /// `Y[k][r - r0] = W[r] . x_k` for rows `[r0, r0 + nrows)`, Y stride `nrows`.
-pub fn q8_gemm(c: &Cact, t: &Tensor, blob: &[u8], a: &Q8Act, r0: usize, nrows: usize, y: &mut [f32]) {
+pub fn q8_gemm(
+    c: &Cact,
+    t: &Tensor,
+    blob: &[u8],
+    a: &Q8Act,
+    r0: usize,
+    nrows: usize,
+    y: &mut [f32],
+) {
     let in_pad = a.in_pad;
     let ng = in_pad / 128;
     let rowb = t.row_bytes();
@@ -282,7 +321,12 @@ pub fn q8_gemm(c: &Cact, t: &Tensor, blob: &[u8], a: &Q8Act, r0: usize, nrows: u
     let mut tab4 = [0u16; 256];
     for i in 0..256 {
         if t.bits == 2 {
-            tab2[i] = u32::from_le_bytes([lv[i & 3] as u8, lv[(i >> 2) & 3] as u8, lv[(i >> 4) & 3] as u8, lv[(i >> 6) & 3] as u8]);
+            tab2[i] = u32::from_le_bytes([
+                lv[i & 3] as u8,
+                lv[(i >> 2) & 3] as u8,
+                lv[(i >> 4) & 3] as u8,
+                lv[(i >> 6) & 3] as u8,
+            ]);
         } else {
             tab4[i] = u16::from_le_bytes([lv[i & 15] as u8, lv[i >> 4] as u8]);
         }
@@ -362,7 +406,12 @@ fn unpack2(p: &[u8], tab: &[u32; 256], w: &mut [u32]) {
         // SAFETY: i < n / 4 words of an aligned source, 4 * i + 3 < n <= w.len().
         unsafe {
             let v = src.add(i).read();
-            let (a, b, c, d) = (tab[(v & 0xFF) as usize], tab[(v >> 8 & 0xFF) as usize], tab[(v >> 16 & 0xFF) as usize], tab[(v >> 24) as usize]);
+            let (a, b, c, d) = (
+                tab[(v & 0xFF) as usize],
+                tab[(v >> 8 & 0xFF) as usize],
+                tab[(v >> 16 & 0xFF) as usize],
+                tab[(v >> 24) as usize],
+            );
             dst.add(4 * i).write(a);
             dst.add(4 * i + 1).write(b);
             dst.add(4 * i + 2).write(c);
@@ -389,7 +438,12 @@ fn unpack4(p: &[u8], tab: &[u16; 256], w: &mut [u32]) {
         // SAFETY: as in unpack2; 2 * i + 1 < n / 2 <= w.len().
         unsafe {
             let v = src.add(i).read();
-            let (a, b, c, d) = (tab[(v & 0xFF) as usize], tab[(v >> 8 & 0xFF) as usize], tab[(v >> 16 & 0xFF) as usize], tab[(v >> 24) as usize]);
+            let (a, b, c, d) = (
+                tab[(v & 0xFF) as usize],
+                tab[(v >> 8 & 0xFF) as usize],
+                tab[(v >> 16 & 0xFF) as usize],
+                tab[(v >> 24) as usize],
+            );
             dst.add(2 * i).write(a as u32 | (b as u32) << 16);
             dst.add(2 * i + 1).write(c as u32 | (d as u32) << 16);
         }
@@ -431,7 +485,14 @@ impl SyncPtr {
 
 /// Reconstruct dequantised row `row` of `t` into `w` (`shape[1]` floats).
 /// `scratch` holds `in_pad` floats. Used for the embedding and engram tables.
-pub fn dequant_row(c: &Cact, t: &Tensor, blob: &[u8], row: usize, scratch: &mut [f32], w: &mut [f32]) {
+pub fn dequant_row(
+    c: &Cact,
+    t: &Tensor,
+    blob: &[u8],
+    row: usize,
+    scratch: &mut [f32],
+    w: &mut [f32],
+) {
     let g = t.group as usize;
     let ng = t.groups();
     let rowb = t.row_bytes();
@@ -462,4 +523,53 @@ pub fn dequant_row(c: &Cact, t: &Tensor, blob: &[u8], row: usize, scratch: &mut 
     }
     let n = t.shape[1] as usize;
     w[..n].copy_from_slice(&scratch[..n]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tensor(inn: u32) -> Tensor {
+        Tensor {
+            dtype: crate::cact::DT_CQ,
+            ndim: 2,
+            shape: [1, inn, 0, 0],
+            offset: 0,
+            nbytes: 0,
+            group: 128,
+            bits: 4,
+        }
+    }
+
+    #[test]
+    fn non_finite_activations_give_zero_groups() {
+        // Two 128-wide groups per row: one finite, one broken.
+        let t = tensor(256);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut x = [0.25f32; 256];
+            x[200] = bad;
+            let q = Q8Act::prepare(&t, &x, 1);
+            let xq = q.xq.as_slice();
+            assert!(xq[..128].iter().any(|&v| v != 0), "finite group was zeroed");
+            assert!(
+                xq[128..256].iter().all(|&v| v == 0),
+                "broken group not zeroed ({bad})"
+            );
+            assert_eq!(q.sx[1], 1.0);
+        }
+    }
+
+    #[test]
+    fn finite_groups_use_the_full_int8_range() {
+        let t = tensor(128);
+        let x: [f32; 128] = core::array::from_fn(|i| i as f32 - 64.0);
+        let q = Q8Act::prepare(&t, &x, 1);
+        let peak =
+            q.xq.as_slice()
+                .iter()
+                .map(|&v| (v as i32).abs())
+                .max()
+                .unwrap();
+        assert_eq!(peak, 127);
+    }
 }

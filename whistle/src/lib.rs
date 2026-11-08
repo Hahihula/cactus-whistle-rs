@@ -12,12 +12,13 @@
 #![no_std]
 #![cfg_attr(target_arch = "xtensa", feature(core_intrinsics))]
 #![cfg_attr(target_arch = "xtensa", allow(internal_features))]
-
 // Kernels index several arrays per loop on purpose: the loops mirror the C
 // engine so the two can be diffed, and evaluation order affects the floats.
 #![allow(clippy::needless_range_loop, clippy::type_complexity)]
 
 extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
 pub mod cact;
 pub mod ladder;
@@ -34,4 +35,4 @@ pub mod bench {
     pub use crate::model::kron;
 }
 
-pub use model::{find_speech, Error, Session, Spec, Whistle, LANGS, N_LANGS};
+pub use model::{Error, LANGS, N_LANGS, Session, Spec, Whistle, find_speech};

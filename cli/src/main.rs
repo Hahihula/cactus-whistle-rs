@@ -1,17 +1,20 @@
 //! `whistle`: the cactus-whistle engine on a desktop.
 //!
-//!     whistle transcribe MODEL.cact CLIP.wav [options]
+//!     whistle transcribe MODEL.cact AUDIO [options]
+//!     whistle listen MODEL.cact [options]
 //!     whistle trim MODEL.cact DEPTH OUT.cact
 //!     whistle info MODEL.cact
 
 mod info;
+mod listen;
 mod transcribe;
 mod trim;
 
 const USAGE: &str = "\
 whistle: Cactus Whistle speech recognition in Rust
 
-  whistle transcribe MODEL.cact CLIP.wav [options]   speech to text
+  whistle transcribe MODEL.cact AUDIO [options]      speech to text (WAV, MP3, OGG, FLAC, M4A)
+  whistle listen MODEL.cact [options]                push to talk from the microphone
   whistle trim MODEL.cact DEPTH OUT.cact             keep DEPTH decoder layers (2..8)
   whistle info MODEL.cact                            header, tensors, trimmed sizes
 
@@ -25,6 +28,7 @@ fn main() {
     };
     match cmd.as_str() {
         "transcribe" => transcribe::run(rest),
+        "listen" => listen::run(rest),
         "trim" => trim::run(rest),
         "info" => info::run(rest),
         "-h" | "--help" | "help" => println!("{USAGE}"),

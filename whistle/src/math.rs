@@ -26,6 +26,8 @@ fn f16_slow(h: u16) -> f32 {
             sign
         } else {
             exp = 127 - 15 + 1;
+            // Terminates: man != 0 here (checked above), so shifting left
+            // reaches bit 10 within ten steps.
             while man & 0x400 == 0 {
                 man <<= 1;
                 exp -= 1;
@@ -72,14 +74,24 @@ pub fn expf(x: f32) -> f32 {
 /// schedule well.
 #[inline(always)]
 pub fn fma(a: f32, b: f32, c: f32) -> f32 {
-    #[cfg(target_arch = "xtensa")]
+    // With std, `mul_add` lowers to LLVM's fma: the hardware instruction
+    // where there is one, and LLVM can vectorise the loops around it, which
+    // it can't do around inline asm (~17% faster encode on an M-series Mac,
+    // same bits). `core` has no `mul_add`, so no_std builds use the asm.
+    #[cfg(feature = "std")]
+    {
+        std::primitive::f32::mul_add(a, b, c)
+    }
+    #[cfg(all(not(feature = "std"), target_arch = "xtensa"))]
     {
         // SAFETY: a pure arithmetic intrinsic, lowered to madd.s (safe on
         // newer toolchains, hence the allow).
         #[allow(unused_unsafe)]
-        unsafe { core::intrinsics::fmaf32(a, b, c) }
+        unsafe {
+            core::intrinsics::fmaf32(a, b, c)
+        }
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(not(feature = "std"), target_arch = "aarch64"))]
     {
         let r: f32;
         // SAFETY: one register-only instruction.
@@ -89,7 +101,7 @@ pub fn fma(a: f32, b: f32, c: f32) -> f32 {
         }
         r
     }
-    #[cfg(all(target_arch = "riscv32", feature = "riscv-fpu"))]
+    #[cfg(all(not(feature = "std"), target_arch = "riscv32", feature = "riscv-fpu"))]
     {
         let r: f32;
         // SAFETY: one register-only instruction.
@@ -99,7 +111,14 @@ pub fn fma(a: f32, b: f32, c: f32) -> f32 {
         }
         r
     }
-    #[cfg(not(any(target_arch = "xtensa", target_arch = "aarch64", all(target_arch = "riscv32", feature = "riscv-fpu"))))]
+    #[cfg(all(
+        not(feature = "std"),
+        not(any(
+            target_arch = "xtensa",
+            target_arch = "aarch64",
+            all(target_arch = "riscv32", feature = "riscv-fpu")
+        ))
+    ))]
     {
         libm::fmaf(a, b, c)
     }
@@ -155,7 +174,20 @@ pub fn fwht(x: &mut [f32]) {
 /// Three butterfly stages (len 1, 2, 4) on 8 values held in registers.
 #[inline(always)]
 fn bfly8(v: &mut [f32; 8]) {
-    for (a, b) in [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)] {
+    for (a, b) in [
+        (0, 1),
+        (2, 3),
+        (4, 5),
+        (6, 7),
+        (0, 2),
+        (1, 3),
+        (4, 6),
+        (5, 7),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ] {
         let (x, y) = (v[a], v[b]);
         v[a] = x + y;
         v[b] = x - y;

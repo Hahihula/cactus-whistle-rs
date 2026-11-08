@@ -20,31 +20,45 @@ codebook weights and is 14.5 MB with 4 of its 8 decoder layers, small enough for
 
 ## Quick start
 
+Download `whistle` for Linux, macOS or Windows from the
+[releases page](https://github.com/Hahihula/cactus-whistle-rs/releases), or build it
+(`cargo build --release`; on Linux, microphone support needs ALSA's headers:
+`sudo apt install libasound2-dev`). Then get the model and trim it:
+
 ```bash
 mkdir -p model
 curl -L -o model/whistle.cact https://huggingface.co/Cactus-Compute/whistle/resolve/main/whistle.cact
-cargo build --release
-./target/release/whistle trim model/whistle.cact 4 model/whistle_d4.cact
-./target/release/whistle transcribe model/whistle_d4.cact some_clip.wav
+whistle trim model/whistle.cact 4 model/whistle_d4.cact   # 14.5 MB; the full model works too
+
+whistle transcribe model/whistle_d4.cact recording.mp3     # a file
+whistle listen model/whistle_d4.cact                       # the microphone
 ```
 
-Clips must be 16 kHz mono 16-bit WAV, for example
-`ffmpeg -i in.m4a -ar 16000 -ac 1 -sample_fmt s16 clip.wav`. On macOS,
+`transcribe` takes WAV, MP3, OGG/Vorbis, FLAC and AAC/M4A at any sample rate, mono
+or stereo; it is mixed down and resampled to the 16 kHz mono the model expects.
+`listen` is push to talk: Enter starts recording, Enter stops and prints the
+transcript, `q` quits. (macOS asks for microphone access the first time.) On macOS,
 `tools/make_clips.sh` writes nine test clips in seven languages into `clips/`.
 
 The transcript goes to stdout. stderr has the detected language, timings and an
-encoder checksum (`enc_fnv`): the same build gives the same value on every
-machine, microcontrollers included.
+encoder checksum (`enc_fnv`): for the same 16 kHz input, the same value on every
+machine, microcontrollers included. (Decoded files reproduce across platforms
+too, except MP3, whose decoder's last bits depend on the platform.)
 
 ## The `whistle` binary
 
 ```text
-whistle transcribe MODEL.cact CLIP.wav [options]   speech to text
-whistle trim MODEL.cact DEPTH OUT.cact             keep DEPTH decoder layers
-whistle info MODEL.cact                            header, tensors, trimmed sizes
+whistle transcribe MODEL.cact AUDIO [options]   speech to text from a file
+whistle listen MODEL.cact [options]             push to talk from the microphone
+whistle trim MODEL.cact DEPTH OUT.cact          keep DEPTH decoder layers
+whistle info MODEL.cact                         header, tensors, trimmed sizes
 ```
 
-`transcribe` options: `--lang xx` forces a language (default: detect), `--spec
+The CLI's extra dependencies (`symphonia` to decode files, `cpal` for the
+microphone) are only in the `cactus-whistle-cli` package; the engine stays
+dependency-free.
+
+`transcribe` and `listen` options: `--lang xx` forces a language (default: detect), `--spec
 guide|fast|c` picks the behaviour (see [Specs](#specs)), and `--depth N` runs N
 decoder layers of an untrimmed model. Debugging options write the log-mel input, the
 encoder output or teacher-forced logits to files; run `whistle transcribe` without
@@ -86,6 +100,7 @@ such as PSRAM works) and nothing else from the platform.
 
 | feature | what |
 |---|---|
+| `std` | for desktops: fused multiply-add through `f32::mul_add`, which LLVM vectorises around (~17% faster encode on a Mac); same results |
 | `riscv-fpu` | `fmadd.s` for fused multiply-add on RISC-V with the F extension; stable Rust doesn't expose it as a cfg, and without it `fma` falls back to software |
 | `fast` | make `Spec::GuideFast` the default (greedy decoding) |
 | `c-engine` | make `Spec::CEngine` the default |
@@ -201,8 +216,9 @@ What mattered on the microcontrollers:
 
 ## Numerics
 
-The float kernels use fused multiply-add (`math::fma`: Xtensa `madd.s`, RISC-V
-`fmadd.s`, AArch64 `fmadd`, otherwise `libm::fmaf`), and transcendental functions
+The float kernels use fused multiply-add (`math::fma`: `f32::mul_add` with the
+`std` feature; otherwise Xtensa `madd.s`, RISC-V `fmadd.s`, AArch64 `fmadd`, or
+`libm::fmaf`), and transcendental functions
 come from the pure-Rust `libm` crate on every target. So a desktop run reproduces a
 microcontroller run bit for bit: hashing the encoder output gives the same `enc_fnv`
 on both microcontrollers above and in `whistle transcribe` on a Mac (`db9a1371` for
@@ -225,6 +241,13 @@ tools/compare.sh                # C engine vs Spec::CEngine on every clip
 
 The library builds for any target with `alloc`, `riscv32imafc` and Xtensa
 included.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs formatting, clippy, the tests, a
+`no_std` build of the engine for two bare-metal targets, and an end-to-end check:
+a spoken clip (espeak-ng) transcribed from WAV, MP3, OGG and FLAC must give the same
+text. Pushing a `v*` tag runs `release.yml`, which builds `whistle` for Linux
+(x86_64, ARM64), macOS (Apple Silicon, Intel) and Windows and attaches the archives
+to the GitHub release.
 
 ## License
 

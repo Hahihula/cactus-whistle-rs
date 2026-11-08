@@ -6,14 +6,17 @@
 use std::path::Path;
 
 use cactus_whistle::{Spec, Whistle};
-use cactus_whistle_cli::read_wav;
+use cactus_whistle_cli::load as read_wav;
 
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 
 /// With the C engine's behaviour these match the C engine (tools/compare.sh).
 const GOLDEN_C_ENGINE: &[(&str, &str)] = &[
     ("clips/en1.wav", "turned the light red for five seconds."),
-    ("clips/en2.wav", "The quick brown fox jumps over the lazy dog."),
+    (
+        "clips/en2.wav",
+        "The quick brown fox jumps over the lazy dog.",
+    ),
     ("clips/fr1.wav", "Bonjour, comment aller vous aujourd'hui ?"),
     ("clips/it1.wav", "Fai l'ampeggiare la luce verde."),
 ];
@@ -21,10 +24,22 @@ const GOLDEN_C_ENGINE: &[(&str, &str)] = &[
 /// With the default (porting guide, 5-beam search) these match Cactus's
 /// official engine, where the C engine's behaviour does not.
 const GOLDEN_GUIDE: &[(&str, &str)] = &[
-    ("clips/eval/en_v1_s3.wav", "Tell me everything you know about Renaissance painters."),
-    ("clips/eval/en_v2_s0_noisy.wav", "Turn the light red for five seconds."),
-    ("clips/eval/en_v4_s0_noisy.wav", "Turn the light red for five seconds."),
-    ("clips/eval/en_v2_s5_noisy.wav", "The weather and card will be cloudy with light rain."),
+    (
+        "clips/eval/en_v1_s3.wav",
+        "Tell me everything you know about Renaissance painters.",
+    ),
+    (
+        "clips/eval/en_v2_s0_noisy.wav",
+        "Turn the light red for five seconds.",
+    ),
+    (
+        "clips/eval/en_v4_s0_noisy.wav",
+        "Turn the light red for five seconds.",
+    ),
+    (
+        "clips/eval/en_v2_s5_noisy.wav",
+        "The weather and card will be cloudy with light rain.",
+    ),
 ];
 
 fn check(spec: Spec, golden: &[(&str, &str)]) {
@@ -79,7 +94,10 @@ fn installed_kernel_is_used_and_exact() {
                 // SAFETY: the engine passes 128 * groups bytes of `w` and
                 // 128 * groups * rows bytes of `x`.
                 let (wg, xg) = unsafe {
-                    (&*w.add(128 * g).cast::<[i8; 128]>(), &*x.add(128 * (r * groups + g)).cast::<[i8; 128]>())
+                    (
+                        &*w.add(128 * g).cast::<[i8; 128]>(),
+                        &*x.add(128 * (r * groups + g)).cast::<[i8; 128]>(),
+                    )
                 };
                 out[r * groups + g] = dot128(wg, xg);
             }
@@ -96,7 +114,10 @@ fn installed_kernel_is_used_and_exact() {
         return;
     };
     let portable = Whistle::open(&blob).unwrap().transcribe(&x, None).unwrap();
-    set_kernel(Some(Kernel { dot_rows, here: || true }));
+    set_kernel(Some(Kernel {
+        dot_rows,
+        here: || true,
+    }));
     let with_kernel = Whistle::open(&blob).unwrap().transcribe(&x, None).unwrap();
     set_kernel(None);
     assert!(CALLS.load(Ordering::Relaxed) > 0, "kernel was never called");

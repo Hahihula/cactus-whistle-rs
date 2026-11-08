@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # cpal (microphone input in the CLI) needs ALSA's headers on Linux.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p cactus-whistle --features std -- -D warnings
+      # Unit tests. The golden transcripts skip without the model and clips;
+      # the next job runs them.
+      - run: cargo test --workspace --release
+
+  golden:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev espeak-ng ffmpeg
+      - uses: Swatinem/rust-cache@v2
+      - name: Model (cached)
+        id: model
+        uses: actions/cache@v4
+        with:
+          path: model/whistle.cact
+          key: whistle-cact-v1
+      - if: steps.model.outputs.cache-hit != 'true'
+        run: mkdir -p model && curl -fL -o model/whistle.cact https://huggingface.co/Cactus-Compute/whistle/resolve/main/whistle.cact
+      - run: cargo build --release
+      - run: ./target/release/whistle trim model/whistle.cact 4 model/whistle_d4.cact
+      # A spoken clip (espeak-ng, not macOS voices) and the same in other
+      # formats: every format must give the same transcript as the WAV.
+      - run: |
+          mkdir -p clips
+          espeak-ng -v en-us -s 140 -w clips/ci.wav "The quick brown fox jumps over the lazy dog."
+          ffmpeg -loglevel error -i clips/ci.wav -ar 44100 -ac 2 clips/ci.mp3
+          ffmpeg -loglevel error -i clips/ci.wav -ar 48000 -c:a libvorbis clips/ci.ogg
+          ffmpeg -loglevel error -i clips/ci.wav clips/ci.flac
+          ref=$(./target/release/whistle transcribe model/whistle_d4.cact clips/ci.wav 2>/dev/null)
+          echo "wav: $ref"
+          test -n "$ref"
+          for f in clips/ci.mp3 clips/ci.ogg clips/ci.flac; do
+            got=$(./target/release/whistle transcribe model/whistle_d4.cact "$f" 2>/dev/null)
+            echo "$f: $got"
+            test "$got" = "$ref"
+          done
+
+  # The engine must stay no_std with no platform dependency.
+  no-std:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf, riscv32imafc-unknown-none-elf
+      - run: cargo build -p cactus-whistle --release --target thumbv7em-none-eabihf
+      - run: cargo build -p cactus-whistle --release --target riscv32imafc-unknown-none-elf --features riscv-fpu

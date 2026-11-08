@@ -158,6 +158,21 @@ pub enum CactError {
     BadRecord(u32),
 }
 
+impl core::fmt::Display for CactError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CactError::TooSmall => f.write_str("file smaller than a .cact header"),
+            CactError::BadTag => f.write_str("not a .cact v4 file (wrong tag)"),
+            CactError::BadGeometry => f.write_str("header describes an impossible model"),
+            CactError::Truncated => f.write_str("file is truncated"),
+            CactError::BadCodebook => f.write_str("codebook too short"),
+            CactError::BadRecord(i) => write!(f, "tensor record {i} is invalid"),
+        }
+    }
+}
+
+impl core::error::Error for CactError {}
+
 pub struct Cact<'a> {
     pub base: &'a [u8],
     pub h: Header4,
@@ -202,7 +217,13 @@ impl<'a> Cact<'a> {
         for (i, v) in codebook.iter_mut().enumerate() {
             *v = f32::from_bits(rd_u32(blob, cb_off + i * 4));
         }
-        Ok(Cact { base: blob, h, codebook, dir_off, n: h.num_tensors })
+        Ok(Cact {
+            base: blob,
+            h,
+            codebook,
+            dir_off,
+            n: h.num_tensors,
+        })
     }
 
     /// Codebook slice for a width of 2, 3 or 4 bits.

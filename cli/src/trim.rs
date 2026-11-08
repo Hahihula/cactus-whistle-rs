@@ -14,7 +14,7 @@ pub fn run(args: &[String]) {
     });
     let blob = crate::read(src);
     let t = ladder::trim(&blob, depth).unwrap_or_else(|e| {
-        eprintln!("cannot trim {src}: {e:?}");
+        eprintln!("cannot trim {src}: {e}");
         std::process::exit(1)
     });
     std::fs::write(dst, &t.blob).unwrap_or_else(|e| {

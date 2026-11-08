@@ -90,7 +90,13 @@ pub fn rows(n: usize, chunk: usize, f: &(dyn Fn(usize, usize) + Sync)) {
         f(0, n);
         return;
     }
-    let job = Job { f, n, chunk, next: AtomicUsize::new(0), done: AtomicUsize::new(0) };
+    let job = Job {
+        f,
+        n,
+        chunk,
+        next: AtomicUsize::new(0),
+        done: AtomicUsize::new(0),
+    };
     // SAFETY (lifetime): the pointer is unpublished and every helper has let
     // go of it (ACTIVE == 0) before `job` goes out of scope below.
     let ptr = &job as *const Job<'_> as *mut Job<'static>;

@@ -66,7 +66,11 @@ impl<'a> Tokenizer<'a> {
             if off + len as usize > blob.len() {
                 return None;
             }
-            pieces.push(Piece { off: off as u32, len, kind });
+            pieces.push(Piece {
+                off: off as u32,
+                len,
+                kind,
+            });
             off += len as usize;
         }
         Some(Tokenizer {
@@ -101,7 +105,9 @@ impl<'a> Tokenizer<'a> {
     pub fn decode(&self, ids: &[u32], strip_dummy: bool) -> String {
         let mut raw: Vec<u8> = Vec::new();
         for &id in ids {
-            let Some(p) = self.pieces.get(id as usize) else { continue };
+            let Some(p) = self.pieces.get(id as usize) else {
+                continue;
+            };
             let s = self.piece(id);
             match p.kind {
                 TK_BYTE => {

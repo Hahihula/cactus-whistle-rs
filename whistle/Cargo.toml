@@ -15,6 +15,10 @@ libm = "0.2"
 
 [features]
 default = []
+# Desktop builds: fused multiply-add through `f32::mul_add`, which LLVM can
+# vectorise around (no_std builds use per-architecture inline asm instead).
+# Same results either way.
+std = []
 # 32-bit RISC-V with the F extension: fused multiply-add as `fmadd.s`.
 # (Stable Rust doesn't expose F as a cfg; without this, `fma` falls back to
 # software.)

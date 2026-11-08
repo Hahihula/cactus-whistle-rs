@@ -1,4 +1,4 @@
-//! `whistle transcribe model.cact clip.wav [options]`
+//! `whistle transcribe model.cact audio-file [options]`
 //!
 //! The transcript goes to stdout, everything else to stderr, as with the C
 //! engine's `wh_run`, so the two can be compared line by line
@@ -7,11 +7,11 @@
 use std::time::Instant;
 
 use cactus_whistle::{LANGS, Whistle};
-use cactus_whistle_cli::read_wav;
+use cactus_whistle_cli::load;
 
 pub const USAGE: &str = "\
-whistle transcribe MODEL.cact CLIP.wav [options]
-  CLIP.wav           16 kHz mono 16-bit PCM
+whistle transcribe MODEL.cact AUDIO [options]
+  AUDIO              WAV, MP3, OGG/Vorbis, FLAC or AAC/M4A, any rate and channels
   --lang xx|auto     force a language (en, de, fr, ...); default: detect
   --spec guide|fast|c
                      guide: the porting guide's front end + 5-beam search (default)
@@ -35,7 +35,8 @@ pub fn run(args: &[String]) {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
-    let (mut lang, mut depth, mut enc_out, mut mel_out, mut enc_in) = (None, None, None, None::<String>, None::<String>);
+    let (mut lang, mut depth, mut enc_out, mut mel_out, mut enc_in) =
+        (None, None, None, None::<String>, None::<String>);
     let (mut lg_out, mut toks_arg) = (None::<String>, None::<String>);
     let (mut front, mut pe, mut beam) = (None::<bool>, None::<bool>, None::<usize>);
     let mut spec = None::<cactus_whistle::Spec>;
@@ -47,7 +48,12 @@ pub fn run(args: &[String]) {
                 lang = if args[i] == "auto" {
                     None
                 } else {
-                    Some(LANGS.iter().position(|l| *l == args[i]).expect("unknown language"))
+                    Some(
+                        LANGS
+                            .iter()
+                            .position(|l| *l == args[i])
+                            .expect("unknown language"),
+                    )
                 };
             }
             "--depth" if i + 1 < args.len() => {
@@ -117,8 +123,10 @@ pub fn run(args: &[String]) {
         });
         std::thread::spawn(|| {
             loop {
+                // Give the CPU back while there's no job, instead of
+                // burning a core at 100%.
                 if !cactus_whistle::par::help() {
-                    std::hint::spin_loop();
+                    std::thread::yield_now();
                 }
             }
         });
@@ -130,7 +138,7 @@ pub fn run(args: &[String]) {
     let mut w = match Whistle::open(&blob) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("cannot open {} as Whistle ({e:?})", args[0]);
+            eprintln!("cannot open {} as Whistle ({e})", args[0]);
             std::process::exit(1);
         }
     };
@@ -149,7 +157,7 @@ pub fn run(args: &[String]) {
     if let Some(d) = depth {
         w.set_depth(d).expect("depth must be 2..layers");
     }
-    let x = read_wav(&args[1]).unwrap_or_else(|e| {
+    let x = load(&args[1]).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1)
     });
@@ -172,7 +180,10 @@ pub fn run(args: &[String]) {
         // Decode an encoder output dumped by another engine (validates the decoder alone).
         Some(p) => {
             let b = std::fs::read(p).expect("enc-in");
-            let e: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let e: Vec<f32> = b
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
             let t = e.len() / w.d;
             (e, t)
         }
@@ -181,7 +192,9 @@ pub fn run(args: &[String]) {
     let t_enc = t0.elapsed().as_secs_f64() * 1e3;
     // A checksum of the encoder output: equal on every machine that runs the
     // same build (the float math is the same everywhere).
-    let fnv = enc.iter().fold(0x811C_9DC5u32, |h, v| (h ^ v.to_bits()).wrapping_mul(0x0100_0193));
+    let fnv = enc.iter().fold(0x811C_9DC5u32, |h, v| {
+        (h ^ v.to_bits()).wrapping_mul(0x0100_0193)
+    });
     eprintln!("enc_fnv {fnv:08x}");
     if let Some(p) = enc_out {
         let bytes: Vec<u8> = enc.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -204,9 +217,19 @@ pub fn run(args: &[String]) {
     let text = w.detok(&ids);
 
     println!("{text}");
-    eprintln!("tokens {}", ids.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "));
+    eprintln!(
+        "tokens {}",
+        ids.iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     if lang.is_none() {
-        let l: Vec<String> = LANGS.iter().zip(w.lang_logit).map(|(n, v)| format!("{n}={v:.2}")).collect();
+        let l: Vec<String> = LANGS
+            .iter()
+            .zip(w.lang_logit)
+            .map(|(n, v)| format!("{n}={v:.2}"))
+            .collect();
         eprintln!("lang_logits {}", l.join(" "));
     }
     eprintln!("score {:.3}", w.score);
@@ -220,6 +243,10 @@ pub fn run(args: &[String]) {
     eprintln!(
         "time  encode {t_enc:.0} ms  decode {t_dec:.0} ms ({} tokens, {:.1} ms/token)",
         ids.len(),
-        if ids.is_empty() { 0.0 } else { t_dec / (ids.len() + 1) as f64 }
+        if ids.is_empty() {
+            0.0
+        } else {
+            t_dec / (ids.len() + 1) as f64
+        }
     );
 }

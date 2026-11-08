@@ -12,11 +12,16 @@ pub fn run(args: &[String]) {
     };
     let blob = crate::read(path);
     let c = Cact::open(&blob).unwrap_or_else(|e| {
-        eprintln!("{path}: not a .cact v4 model ({e:?})");
+        eprintln!("{path}: not a .cact v4 model ({e})");
         std::process::exit(1)
     });
     let h = &c.h;
-    println!("{path}: {} bytes ({:.2} MB), {} tensors", blob.len(), blob.len() as f64 / 1e6, c.n);
+    println!(
+        "{path}: {} bytes ({:.2} MB), {} tensors",
+        blob.len(),
+        blob.len() as f64 / 1e6,
+        c.n
+    );
     println!(
         "decoder: {} layers, d_model {}, {} heads ({} kv), head dim {}/{}, vocab {}, engram sites at layers {:?}",
         h.num_layers,
@@ -36,7 +41,12 @@ pub fn run(args: &[String]) {
         by_type[k].0 += 1;
         by_type[k].1 += t.nbytes;
     }
-    for (name, k) in [("CQ (codebook)", DT_CQ), ("fp16", DT_FP16), ("fp32", DT_FP32), ("raw", DT_RAW)] {
+    for (name, k) in [
+        ("CQ (codebook)", DT_CQ),
+        ("fp16", DT_FP16),
+        ("fp32", DT_FP32),
+        ("raw", DT_RAW),
+    ] {
         let (n, b) = by_type[k as usize];
         if n > 0 {
             println!("  {name:<14} {n:4} tensors  {:7.2} MB", b as f64 / 1e6);
@@ -48,8 +58,12 @@ pub fn run(args: &[String]) {
         println!("decoder depth (`whistle trim`): layers kept, model size");
         for d in 2..=layers {
             match ladder::trim(&blob, d) {
-                Ok(t) => println!("  {d}: {:<26} {:6.2} MB", format!("{:?}", t.layers), t.blob.len() as f64 / 1e6),
-                Err(e) => println!("  {d}: {e:?}"),
+                Ok(t) => println!(
+                    "  {d}: {:<26} {:6.2} MB",
+                    format!("{:?}", t.layers),
+                    t.blob.len() as f64 / 1e6
+                ),
+                Err(e) => println!("  {d}: {e}"),
             }
         }
     }

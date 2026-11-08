@@ -11,7 +11,7 @@
 
 use alloc::vec::Vec;
 
-use crate::cact::{rd_u32, Cact, CactError, DT_CQ, DT_FP16, HDR4_BYTES, HDR4_WORDS, REC_SIZE};
+use crate::cact::{Cact, CactError, DT_CQ, DT_FP16, HDR4_BYTES, HDR4_WORDS, REC_SIZE, rd_u32};
 
 /// Most decoder layers a model may have.
 pub const MAX_LAYERS: usize = 16;
@@ -64,6 +64,28 @@ pub enum TrimError {
     Schema,
     /// A tensor's payload runs past the blob.
     Truncated,
+}
+
+impl core::fmt::Display for TrimError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            TrimError::Cact(e) => write!(f, "invalid .cact file: {e}"),
+            TrimError::BadDepth => {
+                f.write_str("depth must be between 2 and the model's layer count")
+            }
+            TrimError::Schema => f.write_str("tensor count doesn't match the header"),
+            TrimError::Truncated => f.write_str("a tensor runs past the end of the file"),
+        }
+    }
+}
+
+impl core::error::Error for TrimError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            TrimError::Cact(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 impl From<CactError> for TrimError {
@@ -156,7 +178,9 @@ pub fn trim(blob: &[u8], depth: usize) -> Result<Trimmed, TrimError> {
         let rows: Vec<usize> = if k >= 6 {
             // phi_*: n or n*n rows per layer.
             let per = t.shape[0] as usize / l_all;
-            keep.iter().flat_map(|&l| (0..per).map(move |r| l * per + r)).collect()
+            keep.iter()
+                .flat_map(|&l| (0..per).map(move |r| l * per + r))
+                .collect()
         } else {
             keep.clone()
         };
@@ -189,7 +213,9 @@ pub fn trim(blob: &[u8], depth: usize) -> Result<Trimmed, TrimError> {
     w[10] = depth as u32;
     w[31] = sites.len() as u32;
     for k in 0..16 {
-        w[32 + k] = sites.get(k).map_or(0, |&(_, l)| keep.iter().position(|&x| x == l).unwrap() as u32);
+        w[32 + k] = sites.get(k).map_or(0, |&(_, l)| {
+            keep.iter().position(|&x| x == l).unwrap() as u32
+        });
     }
     let cb = &blob[HDR4_BYTES..HDR4_BYTES + 4 * h.codebook_len as usize];
     let data_off = (HDR4_BYTES + cb.len() + out.len() * REC_SIZE).next_multiple_of(ALIGN);
@@ -220,7 +246,11 @@ pub fn trim(blob: &[u8], depth: usize) -> Result<Trimmed, TrimError> {
             b.resize(b.len().next_multiple_of(ALIGN), 0);
         }
     }
-    Ok(Trimmed { blob: b, layers: keep, sites: sites.iter().map(|&(_, l)| l).collect() })
+    Ok(Trimmed {
+        blob: b,
+        layers: keep,
+        sites: sites.iter().map(|&(_, l)| l).collect(),
+    })
 }
 
 /// Tensor `t` restricted to `rows` of its leading axis.
@@ -238,7 +268,11 @@ fn slice_rows(t: &crate::cact::Tensor, d: &[u8], rows: &[usize]) -> (crate::cact
         }
     } else {
         let item = if t.dtype == DT_FP16 { 2 } else { 4 };
-        let per = item * t.shape[1..t.ndim as usize].iter().map(|&s| s as usize).product::<usize>();
+        let per = item
+            * t.shape[1..t.ndim as usize]
+                .iter()
+                .map(|&s| s as usize)
+                .product::<usize>();
         for &k in rows {
             v.extend_from_slice(&d[k * per..(k + 1) * per]);
         }
