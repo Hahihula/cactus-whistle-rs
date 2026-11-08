@@ -1,0 +1,28 @@
+[package]
+name         = "cactus-whistle"
+description  = "no_std inference engine for Cactus Whistle, a multilingual speech recognition model: desktop or bare-metal"
+edition.workspace      = true
+rust-version.workspace = true
+version.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+readme       = "../README.md"
+keywords     = ["speech-recognition", "asr", "no-std", "embedded", "inference"]
+categories   = ["no-std", "embedded", "multimedia::audio", "science"]
+
+[dependencies]
+libm = "0.2"
+
+[features]
+default = []
+# 32-bit RISC-V with the F extension: fused multiply-add as `fmadd.s`.
+# (Stable Rust doesn't expose F as a cfg; without this, `fma` falls back to
+# software.)
+riscv-fpu = []
+# The default Spec is Guide (the porting guide's front end and a 5-beam
+# search). These change the default; every Spec stays available at runtime
+# through Whistle::set_spec.
+# GuideFast: the guide's front end with greedy decoding.
+fast = []
+# CEngine: the C engine's behaviour (andrisgauracs/whistle-esp32).
+c-engine = []

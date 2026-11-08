@@ -1,0 +1,7 @@
+/target
+# downloaded / generated, see README
+/model
+/clips
+/c-engine
+/results
+*.f32

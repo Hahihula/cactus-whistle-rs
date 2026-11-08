@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members  = ["whistle", "cli"]
+
+[workspace.package]
+edition      = "2024"
+rust-version = "1.87"
+version      = "0.1.0"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/Hahihula/cactus-whistle-rs"
+
+[profile.release]
+opt-level     = 3
+debug         = 1
+codegen-units = 1

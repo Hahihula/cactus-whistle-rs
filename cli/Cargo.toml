@@ -1,0 +1,16 @@
+[package]
+name         = "cactus-whistle-cli"
+description  = "Desktop tools for the cactus-whistle engine: transcribe, trim and inspect models"
+edition.workspace      = true
+rust-version.workspace = true
+version.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+publish      = false
+
+[dependencies]
+cactus-whistle = { path = "../whistle" }
+
+[[bin]]
+name = "whistle"
+path = "src/main.rs"
