@@ -1,0 +1,96 @@
+# whistle-train sweep. Paths are relative to this file.
+# Run:   whistle-train run sweep.toml            (dashboard; q stops, state is saved)
+#        whistle-train run sweep.toml --headless  then  whistle-train watch runs_v4
+
+out_dir = "runs_v4"
+# A Python with cactus-needle 3.2.8 and JAX (pip install "cactus-compute[train]").
+python = ".venv/bin/python"
+# Also write tuned_<run>.cact with `needle whistle build` after each run.
+build = false
+# Kill a run whose trainer printed nothing for this long (a hung CUDA crash).
+stall_minutes = 30
+# Go on with the next run after one fails.
+keep_going = false
+
+[data]
+train = "dataset_v2/train.jsonl"
+validation = "dataset_v2/validation.jsonl"
+test = "dataset_v2/test.jsonl"     # optional: WER of each run's best adapter at the end
+tokens = "tokens.txt"
+language = "cs"
+base = "checkpoints/whistle.safetensors"
+
+# Evaluation with the Rust engine and runtime LoRA, on the CPU, at every checkpoint.
+[eval]
+# 4-bit export of the float base (adapters need it; the published 2-bit
+# whistle.cact transcribes far worse). Built with needle if missing.
+base_cact = "model/whistle_w4.cact"
+clips = 200            # validation clips decoded per checkpoint for WER; 0 = off
+threads = 6            # CPU threads; leave some for the trainer
+spec = "fast"          # greedy during training; "guide" is 5-beam (slower)
+lang = "cs"            # force the language; leave out to test detection
+test_at_end = true
+test_spec = "guide"
+# Real recordings transcribed at every checkpoint. A plain path only shows the
+# transcript (compared with the previous checkpoint); { audio, text } also scores
+# it against the reference: WER and a word diff in the Samples tab.
+samples = [
+  { audio = "cz_jirka.wav", text = "Duha je fotometeor, projevující se jako skupina soustředných barevných oblouků, které vznikají lomem a vnitřním odrazem slunečního nebo měsíčního světla na vodních kapkách v atmosféře." },
+  { audio = "hospoda-dusek-sample.wav", text = "No já nevim, nejspíš na strop tam je nejvíc místa, ale to byste se neudrželi, co? Tak na lustr. Hele na blbou otázku blbá odpověď." },
+  { audio = "petr-narozny-sample_1.wav", text = "Sedíme s kolegou před nemocnicí a smějeme se. Jedna z návštěv byla opravdu povedená, ačkoliv to na začátku vypadalo úplně jinak." },
+  { audio = "jarda_sample_small.wav", text = "přijel na několikadenní dovolenou. Hned prvního večera sponzoroval, že se v rodinném ovzduší cosi změnilo. Zpozoroval. Co? Nebyl by dovedl říci co." },
+]
+
+# Trainer settings for every run (a run's own keys override them). Shown with
+# their defaults where not set; the defaults train like `needle whistle finetune`.
+[defaults]
+epochs = 5
+batch_size = 16
+lr = 2e-3
+lora_rank = 16
+lora_alpha = 32
+# warmup = 0.05          # fraction of all steps
+# schedule = "cosine"    # cosine | linear | constant
+# min_lr_ratio = 0.0     # where the decay ends, relative to lr
+weight_decay = 1e-4      # AdamW decay of the adapter (needle: 1e-4)
+rows_weight_decay = 1e-4 # ... of the new vocabulary rows
+# rows_lr_mult = 1.0     # learning rate of the new rows, relative to lr
+# grad_clip = 1.0
+# lora_dropout = 0.0     # rank dropout: each step zeroes rank components with this probability
+seed = 0
+evals_per_epoch = 4      # validation + checkpoint + Rust evaluation 4x per epoch
+# early_stop = 0         # stop after N evaluations without a better validation loss
+# max_steps = 0
+# limit_train = 0        # first N clips only, for a quick try
+
+# Augmentation (off by default). Volume changes are left out on purpose: the
+# front end normalises every clip's log-mel, so they would change nothing.
+[defaults.augment]
+# speed_prob = 0.0       # share of clips resampled by a factor in [speed_lo, speed_hi]
+# speed_lo = 0.9
+# speed_hi = 1.1
+# freq_masks = 0         # SpecAugment: masked mel bands per clip ...
+# freq_width = 10        # ... up to this many of the 80 bins each
+# time_masks = 0         # masked time spans per clip ...
+# time_width = 0.05      # ... up to this fraction of the clip each
+# noise_dir = ""         # WAV files mixed in as background noise
+# noise_prob = 0.0
+# snr_lo = 5.0
+# snr_hi = 20.0
+
+# The runs. Sweep 3's winner (lr 2e-3, batch 16, rank 16) as the baseline, then
+# one change at a time.
+[[run]]
+name = "v4_base"
+
+[[run]]
+name = "v4_wd1e-2"
+weight_decay = 1e-2
+
+[[run]]
+name = "v4_drop0.1"
+lora_dropout = 0.1
+
+[[run]]
+name = "v4_specaug"
+augment = { freq_masks = 2, time_masks = 2, speed_prob = 0.5 }

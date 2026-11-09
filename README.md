@@ -15,6 +15,10 @@ codebook weights and is 14.5 MB with 4 of its 8 decoder layers, small enough for
   a platform's SIMD dot-product kernel through a hook.
 - **`whistle`** (`cli/`): a desktop binary to transcribe WAV files, trim models to fewer
   decoder layers and inspect them.
+- **`whistle-train`** (`trainer/`): LoRA fine-tuning with sweeps, live evaluation with
+  the Rust engine and a training dashboard (see [Fine-tuning](#fine-tuning)).
+- **`cactus-whistle-common`** (`common/`): desktop code the two binaries share (audio
+  files, adapters, datasets, WER).
 - **`tools/`**: test clips, an evaluation against Cactus's official engine, and an
   optional comparison with the C engine this port started from.
 
@@ -115,6 +119,50 @@ decoder depth (`whistle trim`): layers kept, model size
 ```
 
 The output is byte-identical to `whistle_strip.py` from whistle-esp32.
+
+## Fine-tuning
+
+`whistle-train` fine-tunes Whistle with LoRA (new languages, tokens, accents) through
+sweeps of runs, with a terminal dashboard:
+
+```bash
+whistle-train example > sweep.toml      # edit paths and runs
+whistle-train run sweep.toml            # train the runs one after another
+whistle-train run sweep.toml --headless # or without the dashboard (tmux, ssh) ...
+whistle-train watch runs_v4             # ... and watch it from anywhere
+```
+
+The training itself runs on the GPU in Python: `trainer/python/whistle_train.py`
+reimplements `needle whistle finetune` on the model code of `cactus-needle` 3.2.8 (`pip
+install "cactus-compute[train]"`). With default settings it trains the same way
+(same schedule, same numerics; validation losses agree to GPU noise). It adds the
+settings the `needle` CLI lacks:
+
+- **optimiser:** weight decay (separately for the adapter and the new vocabulary rows),
+  the rows' learning rate, warmup, schedule (cosine, linear, constant) and its floor,
+  gradient clipping;
+- **adapter:** rank, alpha and rank dropout. The model has no dropout layers, and
+  training merges the adapter into the weights before quantising them, so this
+  dropout zeroes random rank components each step;
+- **checkpoints:** validation several times per epoch, the best adapter kept
+  (`adapter_best.safetensors`; `needle` keeps the last epoch's), early stopping, and a
+  saved state, so a stopped or crashed run resumes where it was;
+- **augmentation:** speed perturbation, SpecAugment and background noise. Volume
+  changes are left out because the front end normalises every clip.
+
+While the GPU trains, the Rust side evaluates every checkpoint on the CPU with the
+engine and runtime LoRA: WER on a slice of the validation split, plus transcripts of
+your own recordings (the in-domain test set alone can mislead). At the end of a run it
+scores the best adapter on the whole test split. The dashboard shows the runs, loss and
+WER curves, sample transcripts compared with their references or the previous
+checkpoint, plain-language hints (overfitting, learning rate too high, unused
+tokens, ...) and the log. A run that goes silent (a hung CUDA crash) is killed, and the
+GPU is checked before each run.
+
+Each run writes `runs_v4/<run>/`: `events.jsonl` (everything the dashboard shows),
+`config.json`, the exact `whistle_train.py` it ran, `checkpoints/`, `adapter_best` and
+`adapter_last`, `test_hyp.jsonl`, and with `build = true` a merged `tuned_<run>.cact`.
+`trainer/sweep.example.toml` documents every setting.
 
 ## Using the library
 

@@ -1,7 +1,8 @@
 //! `whistle eval MODEL.cact SPLIT.jsonl --out HYP.jsonl [options]`:
 //! transcribe a dataset split (the fine-tuning JSONL format: `audio` relative
 //! to the file, `text`, `language`) on every core and write one
-//! `{"audio", "ref", "hyp", "lang"}` line per clip, in input order.
+//! `{"audio", "ref", "hyp", "lang"}` line per clip, in input order, and
+//! print the WER per source (Whisper's normaliser, as the fine-tuning log).
 
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,6 +10,7 @@ use std::time::Instant;
 
 use cactus_whistle::{Spec, Whistle};
 use cactus_whistle_cli::{load, load_lora};
+use cactus_whistle_common::{dataset, wer};
 
 pub const USAGE: &str = "\
 whistle eval MODEL.cact SPLIT.jsonl --out HYP.jsonl [options]
@@ -20,12 +22,6 @@ whistle eval MODEL.cact SPLIT.jsonl --out HYP.jsonl [options]
   --spec guide|fast|c
   --limit N          only the first N clips
   --threads N        worker threads (default: all cores)";
-
-struct Row {
-    audio: String,
-    text: String,
-    lang: Option<String>,
-}
 
 pub fn run(args: &[String]) {
     if args.len() < 2 {
@@ -68,31 +64,14 @@ pub fn run(args: &[String]) {
         std::process::exit(2);
     };
 
-    let text = std::fs::read_to_string(split).unwrap_or_else(|e| {
-        eprintln!("{split}: {e}");
+    let rows = dataset::read_jsonl(
+        std::path::Path::new(split),
+        (limit != usize::MAX).then_some(limit),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("{e}");
         std::process::exit(1)
     });
-    let root = std::path::Path::new(split)
-        .parent()
-        .unwrap_or(std::path::Path::new("."));
-    let rows: Vec<Row> = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .take(limit)
-        .enumerate()
-        .map(|(i, l)| {
-            let v: serde_json::Value = serde_json::from_str(l).unwrap_or_else(|e| {
-                eprintln!("{split}:{}: {e}", i + 1);
-                std::process::exit(1)
-            });
-            let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
-            Row {
-                audio: s("audio").expect("row without audio"),
-                text: s("text").unwrap_or_default(),
-                lang: s("language"),
-            }
-        })
-        .collect();
 
     let blob = crate::read(model_path);
     let probe = Whistle::open(&blob).unwrap_or_else(|e| {
@@ -156,11 +135,10 @@ pub fn run(args: &[String]) {
                     let Some(r) = rows.get(i) else { break };
                     let lang = match lang_arg.as_str() {
                         "auto" => None,
-                        "row" => r.lang.as_deref().and_then(|c| w.lang_index(c)),
+                        "row" => r.language.as_deref().and_then(|c| w.lang_index(c)),
                         _ => forced,
                     };
-                    let path = root.join(&r.audio);
-                    let hyp = load(path.to_str().unwrap_or_default())
+                    let hyp = load(r.path.to_str().unwrap_or_default())
                         .map_err(|e| e.to_string())
                         .and_then(|x| w.transcribe(&x, lang).map_err(|e| e.to_string()));
                     let hyp = hyp.unwrap_or_else(|e| {
@@ -187,9 +165,24 @@ pub fn run(args: &[String]) {
         eprintln!("{out}: {e}");
         std::process::exit(1)
     }));
+    let mut report = wer::Report::default();
     for (r, (hyp, lang)) in rows.iter().zip(&hyps) {
         let line = serde_json::json!({"audio": r.audio, "ref": r.text, "hyp": hyp, "lang": lang});
         writeln!(f, "{line}").expect("write");
+        report.add(&r.source, &r.text, hyp);
+    }
+    println!("{:<12}{:>7}{:>8}{:>8}", "source", "clips", "wer", "strict");
+    for (src, c) in report
+        .by_source
+        .iter()
+        .chain([(&"ALL".to_string(), &report.all)])
+    {
+        println!(
+            "{src:<12}{:>7}{:>7.1}%{:>7.1}%",
+            c.clips,
+            100.0 * c.wer(),
+            100.0 * c.strict()
+        );
     }
     eprintln!("wrote {out}  ({:.0} s)", t0.elapsed().as_secs_f64());
 }

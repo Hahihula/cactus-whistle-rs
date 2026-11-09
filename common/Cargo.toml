@@ -1,0 +1,19 @@
+[package]
+name         = "cactus-whistle-common"
+description  = "Desktop helpers shared by the whistle CLI and the fine-tuning tool: audio files, adapters, datasets, WER"
+edition.workspace      = true
+rust-version.workspace = true
+version.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+publish      = false
+
+[dependencies]
+cactus-whistle = { path = "../whistle", features = ["std"] }
+symphonia = { version = "0.6", default-features = false, features = ["mp3", "ogg", "vorbis", "flac", "wav", "pcm", "aac", "isomp4"] }
+libm = "0.2"
+safetensors = "0.8.0"
+serde = "1.0.229"
+serde_json = "1.0.154"
+unicode-normalization = "0.1.26"
+unicode-general-category = "1.1.0"

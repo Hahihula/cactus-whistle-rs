@@ -10,13 +10,11 @@ publish      = false
 
 [dependencies]
 cactus-whistle = { path = "../whistle", features = ["std"] }
-# Desktop only: decoding audio files of any common format, microphone input.
-symphonia = { version = "0.6", default-features = false, features = ["mp3", "ogg", "vorbis", "flac", "wav", "pcm", "aac", "isomp4"] }
-cpal = "0.18"
-libm = "0.2"
-safetensors = "0.8.0"
+# Audio files, adapters, datasets and WER, shared with whistle-train.
+cactus-whistle-common = { path = "../common" }
 serde_json = "1.0.154"
-serde = "1.0.229"
+# Desktop only: microphone input.
+cpal = "0.18"
 
 [[bin]]
 name = "whistle"

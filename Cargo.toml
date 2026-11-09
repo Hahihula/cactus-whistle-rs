@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members  = ["whistle", "cli"]
+members  = ["whistle", "common", "cli", "trainer"]
 
 [workspace.package]
 edition      = "2024"
