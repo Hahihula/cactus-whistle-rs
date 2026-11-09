@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use cactus_whistle::{Spec, Whistle};
+use cactus_whistle::{Error, LANGS, Spec, Whistle};
 use cactus_whistle_cli::load as read_wav;
 
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
@@ -64,6 +64,41 @@ fn check(spec: Spec, golden: &[(&str, &str)]) {
 #[test]
 fn default_is_the_guide_spec() {
     assert_eq!(Spec::DEFAULT, Spec::Guide);
+}
+
+/// The languages come from the model's `<|xx|>` tags; for the shipped model
+/// they are LANGS. (A fine-tune that adds tokens or languages moves the tags;
+/// `WHISTLE_TUNED=model.cact:xx` also checks one that adds language xx.)
+#[test]
+fn languages_come_from_the_model() {
+    let model = Path::new(ROOT).join("model/whistle_d4.cact");
+    let Ok(blob) = std::fs::read(&model) else {
+        eprintln!("skip: {} missing", model.display());
+        return;
+    };
+    let mut w = Whistle::open(&blob).expect("open");
+    let codes: Vec<&str> = (0..w.n_langs()).map(|i| w.lang_code(i)).collect();
+    assert_eq!(codes, LANGS);
+    assert_eq!(w.lang_index("pl"), Some(6));
+    assert_eq!(w.lang_index("cs"), None);
+    assert_eq!(w.lang_code(7), "");
+    assert_eq!(
+        w.transcribe(&[0.0; 16000], Some(7)),
+        Err(Error::BadLanguage)
+    );
+
+    let Ok(tuned) = std::env::var("WHISTLE_TUNED") else {
+        return;
+    };
+    let (path, code) = tuned.rsplit_once(':').expect("WHISTLE_TUNED=model.cact:xx");
+    let blob = std::fs::read(path).expect("WHISTLE_TUNED model");
+    let w = Whistle::open(&blob).expect("open tuned");
+    assert!(w.n_langs() > LANGS.len());
+    assert_eq!(
+        &(0..LANGS.len()).map(|i| w.lang_code(i)).collect::<Vec<_>>(),
+        &LANGS
+    );
+    assert_eq!(w.lang_index(code), Some(w.n_langs() - 1));
 }
 
 #[test]

@@ -58,6 +58,10 @@ The CLI's extra dependencies (`symphonia` to decode files, `cpal` for the
 microphone) are only in the `cactus-whistle-cli` package; the engine stays
 dependency-free.
 
+Models fine-tuned with Cactus's tooling (`needle whistle finetune` + `build`) work too,
+including ones that add tokens or a new language: the engine reads the model's languages
+from its tokenizer, so `--lang cs` and detection work on a model that adds Czech.
+
 `transcribe` and `listen` options: `--lang xx` forces a language (default: detect), `--spec
 guide|fast|c` picks the behaviour (see [Specs](#specs)), and `--depth N` runs N
 decoder layers of an untrimmed model. Debugging options write the log-mel input, the
@@ -92,7 +96,7 @@ cactus-whistle = "0.1"
 let blob: &[u8] = /* the .cact file: a memory-mapped flash partition, or a Vec */;
 let mut w = cactus_whistle::Whistle::open(blob)?;
 let text = w.transcribe(&samples_16khz_f32, None)?; // None: detect the language
-let lang = cactus_whistle::LANGS[w.lang];
+let lang = w.lang_code(w.lang); // "en", ..., or a language a fine-tune added
 ```
 
 It needs a global allocator for activations (on a microcontroller, external RAM

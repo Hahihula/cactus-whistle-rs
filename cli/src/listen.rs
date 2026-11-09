@@ -8,8 +8,9 @@ use std::{
     time::Instant,
 };
 
-use cactus_whistle::{LANGS, Spec, Whistle};
+use cactus_whistle::{Spec, Whistle};
 use cactus_whistle_cli::audio::{self, RATE};
+use cactus_whistle_cli::resolve_lang;
 use cpal::{
     FromSample, SampleFormat, SizedSample,
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -25,17 +26,11 @@ pub fn run(args: &[String]) {
         eprintln!("{USAGE}");
         std::process::exit(2);
     };
-    let (mut lang, mut spec) = (None, Spec::DEFAULT);
+    let (mut lang_arg, mut spec) = (None::<String>, Spec::DEFAULT);
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match (a.as_str(), it.next()) {
-            ("--lang", Some(l)) if l == "auto" => lang = None,
-            ("--lang", Some(l)) => {
-                lang = Some(LANGS.iter().position(|x| x == l).unwrap_or_else(|| {
-                    eprintln!("unknown language {l}; one of {}", LANGS.join(", "));
-                    std::process::exit(2)
-                }))
-            }
+            ("--lang", Some(l)) => lang_arg = Some(l.clone()),
             ("--spec", Some(s)) => {
                 spec = match s.as_str() {
                     "guide" => Spec::Guide,
@@ -60,6 +55,10 @@ pub fn run(args: &[String]) {
         std::process::exit(1)
     });
     w.set_spec(spec);
+    let lang = resolve_lang(&w, lang_arg.as_deref()).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
 
     let device = cpal::default_host()
         .default_input_device()
@@ -114,7 +113,7 @@ pub fn run(args: &[String]) {
                 println!("{text}");
                 eprintln!(
                     "[{}] {secs:.1} s of audio, {:.2} s to transcribe",
-                    LANGS[w.lang],
+                    w.lang_code(w.lang),
                     t0.elapsed().as_secs_f32()
                 );
             }

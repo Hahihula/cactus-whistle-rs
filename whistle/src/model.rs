@@ -24,8 +24,14 @@ use crate::prof;
 use crate::quant::{Q8Act, dequant_row, q8_gemm, q8_ok};
 use crate::tokenizer::Tokenizer;
 
+/// Languages of the shipped Whistle model, in tag order. A fine-tuned model
+/// can add languages: use [`Whistle::lang_code`] and [`Whistle::lang_index`],
+/// which read the model's own list.
 pub const LANGS: [&str; 7] = ["en", "de", "fr", "es", "it", "nl", "pl"];
+/// Number of languages of the shipped model; see [`LANGS`].
 pub const N_LANGS: usize = 7;
+/// Most languages a model may have (one bit each in [`Whistle::lang_mask`]).
+pub const MAX_LANGS: usize = 32;
 use crate::ladder::MAX_LAYERS;
 const SINKHORN: usize = 20;
 const EG_HIST: usize = 16;
@@ -33,7 +39,6 @@ const EG_SEED: u32 = 0x9E37_79B9;
 const EG_PRIME: u32 = 0x0100_0193;
 const BOS_ID: u32 = 2;
 const EOS_ID: u32 = 1;
-const LANG_BASE: u32 = 8192;
 // Front end as the C engine (andrisgauracs/whistle-esp32) runs it.
 const LOG_EPS: f32 = 6e-7;
 const NORM_EPS: f32 = 1e-3;
@@ -177,6 +182,7 @@ pub enum Error {
     Tokenizer,
     BadDepth,
     ClipTooShort,
+    BadLanguage,
 }
 
 impl From<CactError> for Error {
@@ -201,6 +207,7 @@ impl core::fmt::Display for Error {
                 f.write_str("decoder depth must be between 2 and the model's layer count")
             }
             Error::ClipTooShort => f.write_str("audio too short to transcribe"),
+            Error::BadLanguage => f.write_str("language index is not one of the model's languages"),
         }
     }
 }
@@ -278,6 +285,10 @@ pub struct Whistle<'a> {
     lanes: usize,
     taps: usize,
     pub vocab: usize,
+    /// Token id of the first language tag; ids below it are text.
+    lang_base: u32,
+    /// Languages of the model (tags `lang_base..vocab`).
+    n_langs: usize,
     max_seq: usize,
     pub dec_layers: usize,
     pub enc_layers: usize,
@@ -313,13 +324,15 @@ pub struct Whistle<'a> {
     pub depth: usize,
     active: [usize; MAX_LAYERS],
 
-    /// Language of the last decode (index into [`LANGS`]).
+    /// Language of the last decode (index into the model's languages; see
+    /// [`Whistle::lang_code`]).
     pub lang: usize,
-    /// The detection's scores for each language.
-    pub lang_logit: [f32; N_LANGS],
+    /// The detection's scores for each language (the first
+    /// [`Whistle::n_langs`] entries).
+    pub lang_logit: [f32; MAX_LANGS],
     /// Mean log-prob of the last transcript.
     pub score: f32,
-    /// Bit i enables language i for detection.
+    /// Bit i enables language i for detection; 0 enables all.
     pub lang_mask: u32,
     /// Front end per the porting guide (99th-percentile RMS gain to 0.1,
     /// symmetric Hann, log floor 2^-24, std epsilon 1e-5) instead of the C
@@ -1448,7 +1461,7 @@ impl<'a> Whistle<'a> {
         let mut pos = 0usize;
         self.dec_step(BOS_ID, pos, s);
         pos += 1;
-        let mut tok = LANG_BASE + lang as u32;
+        let mut tok = self.lang_base + lang as u32;
         while pos < self.max_seq {
             let hid = self.dec_step(tok, pos, s);
             pos += 1;
@@ -1494,18 +1507,21 @@ impl<'a> Whistle<'a> {
         let mut s = self.session(enc, t);
         let _s = prof::span(prof::DECODER);
         let lang = match lang {
-            Some(l) => l,
+            Some(l) => {
+                assert!(l < self.n_langs, "language index {l} out of range");
+                l
+            }
             None => {
                 let hid = self.dec_step(BOS_ID, 0, &mut s);
                 let lg = self.logits(&hid);
                 let mask = if self.lang_mask != 0 {
                     self.lang_mask
                 } else {
-                    0x7F
+                    u32::MAX
                 };
                 let mut best: Option<usize> = None;
-                for k in 0..N_LANGS {
-                    self.lang_logit[k] = lg[LANG_BASE as usize + k];
+                for k in 0..self.n_langs {
+                    self.lang_logit[k] = lg[self.lang_base as usize + k];
                     if mask & (1 << k) != 0
                         && best.is_none_or(|b| self.lang_logit[k] > self.lang_logit[b])
                     {
@@ -1547,7 +1563,7 @@ impl<'a> Whistle<'a> {
             s: s0.clone(),
             toks: Vec::new(),
             score: 0.0,
-            next: LANG_BASE + lang as u32,
+            next: self.lang_base + lang as u32,
         }];
         let mut done: Vec<(f32, Vec<u32>)> = Vec::new();
         let mut pos = 1;
@@ -1565,7 +1581,7 @@ impl<'a> Whistle<'a> {
             }
             let mut props: Vec<(f32, usize, u32)> = Vec::with_capacity(live.len() * BEAM_PROPOSALS);
             for (bi, b) in live.iter().enumerate() {
-                let text = &lg[bi * vocab..bi * vocab + LANG_BASE as usize];
+                let text = &lg[bi * vocab..bi * vocab + self.lang_base as usize];
                 let mut mx = text[0];
                 for &v in &text[1..] {
                     mx = mx.max(v);
@@ -1628,6 +1644,28 @@ impl<'a> Whistle<'a> {
     }
 
     /// Ids to text, with every leading space removed.
+    /// Number of languages the model knows (7 for the shipped model; a
+    /// fine-tune can add more).
+    pub fn n_langs(&self) -> usize {
+        self.n_langs
+    }
+
+    /// Code of language `i` (`"en"`, `"cs"`, ...), read from the model's
+    /// `<|xx|>` tag; `""` if `i` is out of range.
+    pub fn lang_code(&self, i: usize) -> &'a str {
+        if i >= self.n_langs {
+            return "";
+        }
+        let piece = self.tok.piece(self.lang_base + i as u32);
+        // Validated as UTF-8 `<|..|>` when the model was opened.
+        core::str::from_utf8(&piece[2..piece.len() - 2]).unwrap_or("")
+    }
+
+    /// Index of the language with code `code`, if the model has it.
+    pub fn lang_index(&self, code: &str) -> Option<usize> {
+        (0..self.n_langs).find(|&i| self.lang_code(i) == code)
+    }
+
     pub fn detok(&self, ids: &[u32]) -> String {
         let s = self.tok.decode(ids, true);
         String::from(s.trim_start_matches(' '))
@@ -1635,6 +1673,9 @@ impl<'a> Whistle<'a> {
 
     /// Full pipeline: samples -> (text, language index).
     pub fn transcribe(&mut self, x: &[f32], lang: Option<usize>) -> Result<String, Error> {
+        if lang.is_some_and(|l| l >= self.n_langs) {
+            return Err(Error::BadLanguage);
+        }
         let (enc, t) = self.encode(x)?;
         let ids = self.decode(&enc, t, lang, 320);
         Ok(self.detok(&ids))
@@ -1770,6 +1811,25 @@ impl<'a> Whistle<'a> {
             return Err(Error::Layout);
         }
         let tok = Tokenizer::new(p[i_tok]).ok_or(Error::Tokenizer)?;
+        // The language tags are the last pieces, `<|en|>`, `<|de|>`, ...: the
+        // shipped model has 7 after 8192 text pieces, and a fine-tune that adds
+        // tokens or languages moves and extends them.
+        let vocab = h.vocab_size as usize;
+        if tok.len() != vocab || t[i_emb].shape[0] as usize != vocab {
+            return Err(Error::Tokenizer);
+        }
+        let is_tag = |id: usize| {
+            let s = tok.piece(id as u32);
+            s.len() > 4
+                && s.starts_with(b"<|")
+                && s.ends_with(b"|>")
+                && core::str::from_utf8(s).is_ok()
+        };
+        let n_langs = (0..vocab).rev().take_while(|&id| is_tag(id)).count();
+        if n_langs == 0 || n_langs > MAX_LANGS || n_langs >= vocab {
+            return Err(Error::Tokenizer);
+        }
+        let lang_base = (vocab - n_langs) as u32;
         let h16 = t
             .iter()
             .zip(&p)
@@ -1798,7 +1858,9 @@ impl<'a> Whistle<'a> {
             vd,
             lanes,
             taps,
-            vocab: h.vocab_size as usize,
+            vocab,
+            lang_base,
+            n_langs,
             max_seq: h.max_seq_len as usize,
             dec_layers,
             enc_layers,
@@ -1831,9 +1893,9 @@ impl<'a> Whistle<'a> {
             depth: 0,
             active: [0; MAX_LAYERS],
             lang: 0,
-            lang_logit: [0.0; N_LANGS],
+            lang_logit: [0.0; MAX_LANGS],
             score: 0.0,
-            lang_mask: 0x7F,
+            lang_mask: 0,
             front_blog: false,
             pe_memory: false,
             beams: 1,

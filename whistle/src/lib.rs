@@ -35,4 +35,4 @@ pub mod bench {
     pub use crate::model::kron;
 }
 
-pub use model::{Error, LANGS, N_LANGS, Session, Spec, Whistle, find_speech};
+pub use model::{Error, LANGS, MAX_LANGS, N_LANGS, Session, Spec, Whistle, find_speech};

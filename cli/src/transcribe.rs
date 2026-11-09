@@ -6,13 +6,14 @@
 
 use std::time::Instant;
 
-use cactus_whistle::{LANGS, Whistle};
-use cactus_whistle_cli::load;
+use cactus_whistle::Whistle;
+use cactus_whistle_cli::{lang_codes, load, resolve_lang};
 
 pub const USAGE: &str = "\
 whistle transcribe MODEL.cact AUDIO [options]
   AUDIO              WAV, MP3, OGG/Vorbis, FLAC or AAC/M4A, any rate and channels
-  --lang xx|auto     force a language (en, de, fr, ...); default: detect
+  --lang xx|auto     force a language (en, de, fr, ..., or one a
+                     fine-tune added); default: detect
   --spec guide|fast|c
                      guide: the porting guide's front end + 5-beam search (default)
                      fast:  the same front end, greedy decoding
@@ -35,8 +36,8 @@ pub fn run(args: &[String]) {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
-    let (mut lang, mut depth, mut enc_out, mut mel_out, mut enc_in) =
-        (None, None, None, None::<String>, None::<String>);
+    let (mut lang_arg, mut depth, mut enc_out, mut mel_out, mut enc_in) =
+        (None::<String>, None, None, None::<String>, None::<String>);
     let (mut lg_out, mut toks_arg) = (None::<String>, None::<String>);
     let (mut front, mut pe, mut beam) = (None::<bool>, None::<bool>, None::<usize>);
     let mut spec = None::<cactus_whistle::Spec>;
@@ -45,16 +46,7 @@ pub fn run(args: &[String]) {
         match args[i].as_str() {
             "--lang" if i + 1 < args.len() => {
                 i += 1;
-                lang = if args[i] == "auto" {
-                    None
-                } else {
-                    Some(
-                        LANGS
-                            .iter()
-                            .position(|l| *l == args[i])
-                            .expect("unknown language"),
-                    )
-                };
+                lang_arg = Some(args[i].clone());
             }
             "--depth" if i + 1 < args.len() => {
                 i += 1;
@@ -142,6 +134,10 @@ pub fn run(args: &[String]) {
             std::process::exit(1);
         }
     };
+    let lang = resolve_lang(&w, lang_arg.as_deref()).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     if let Some(sp) = spec {
         w.set_spec(sp);
     }
@@ -225,7 +221,7 @@ pub fn run(args: &[String]) {
             .join(" ")
     );
     if lang.is_none() {
-        let l: Vec<String> = LANGS
+        let l: Vec<String> = lang_codes(&w)
             .iter()
             .zip(w.lang_logit)
             .map(|(n, v)| format!("{n}={v:.2}"))
@@ -235,7 +231,7 @@ pub fn run(args: &[String]) {
     eprintln!("score {:.3}", w.score);
     eprintln!(
         "language {}{}\naudio {:.2} s  frames {t}  depth {}",
-        LANGS[w.lang],
+        w.lang_code(w.lang),
         if lang.is_none() { " (detected)" } else { "" },
         x.len() as f64 / 16000.0,
         w.depth
