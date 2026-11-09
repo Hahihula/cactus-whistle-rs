@@ -62,6 +62,37 @@ Models fine-tuned with Cactus's tooling (`needle whistle finetune` + `build`) wo
 including ones that add tokens or a new language: the engine reads the model's languages
 from its tokenizer, so `--lang cs` and detection work on a model that adds Czech.
 
+### LoRA adapters without merging
+
+`--lora adapter.safetensors` runs a fine-tuning adapter on its base model, so there's
+no `needle whistle build` between training and listening; `--lora-strength X` scales its
+update (1 = as trained, 0 = the base model with the adapter's tokens and languages):
+
+```bash
+whistle transcribe model/whistle_w4.cact clip.wav --lora adapter.safetensors --lora-strength 0.8
+whistle listen model/whistle_w4.cact --lora adapter.safetensors
+```
+
+The base must be a **4-bit** export of the float checkpoint the adapter was trained from,
+since training simulates that quantisation. The published `whistle.cact` has 2-bit
+weights, and an adapter on it transcribes noticeably worse. Until this repository can
+export one itself, `needle` writes it from an empty adapter:
+
+```bash
+python -c "from needle.model.checkpoints import write_adapter; write_adapter('empty.safetensors', \
+  {'lora': {}, 'rows': None, 'scale': 1.0, 'base': 'checkpoints/whistle.safetensors', 'rank': 0, \
+   'seed': 0, 'pieces': [], 'languages': ['en','de','fr','es','it','nl','pl']})"
+needle whistle build --lora empty.safetensors --out model/whistle_w4.cact
+```
+
+The engine adds the update in float beside each int8 matmul, while `needle whistle
+build` merges it into the weights before quantising, so the two give close but not
+identical transcripts. A model trimmed with `whistle trim` takes an adapter trained on all
+8 decoder layers.
+
+`whistle eval MODEL.cact SPLIT.jsonl --out HYP.jsonl [--lora ...]` transcribes a dataset
+split in the fine-tuning JSONL format on every core and writes the hypotheses.
+
 `transcribe` and `listen` options: `--lang xx` forces a language (default: detect), `--spec
 guide|fast|c` picks the behaviour (see [Specs](#specs)), and `--depth N` runs N
 decoder layers of an untrimmed model. Debugging options write the log-mel input, the
@@ -98,6 +129,11 @@ let mut w = cactus_whistle::Whistle::open(blob)?;
 let text = w.transcribe(&samples_16khz_f32, None)?; // None: detect the language
 let lang = w.lang_code(w.lang); // "en", ..., or a language a fine-tune added
 ```
+
+A LoRA adapter is a `cactus_whistle::Lora` of borrowed `f32` slices (the per-layer
+`A`/`B` matrices, the added vocabulary rows and the extended tokenizer from
+`tokenizer::extend`); `w.set_lora(Some(&lora))` checks that it fits and
+`w.lora_strength` scales it. The CLI's `lora.rs` builds one from a `.safetensors` file.
 
 It needs a global allocator for activations (on a microcontroller, external RAM
 such as PSRAM works) and nothing else from the platform.

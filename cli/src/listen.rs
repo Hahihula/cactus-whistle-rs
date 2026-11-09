@@ -10,7 +10,7 @@ use std::{
 
 use cactus_whistle::{Spec, Whistle};
 use cactus_whistle_cli::audio::{self, RATE};
-use cactus_whistle_cli::resolve_lang;
+use cactus_whistle_cli::{load_lora, resolve_lang};
 use cpal::{
     FromSample, SampleFormat, SizedSample,
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -18,6 +18,7 @@ use cpal::{
 
 pub const USAGE: &str = "\
 whistle listen MODEL.cact [--lang xx|auto] [--spec guide|fast|c]
+               [--lora ADAPTER [--lora-strength X]]
   Push to talk from the default microphone: Enter starts recording, Enter
   stops and transcribes; q + Enter quits.";
 
@@ -27,10 +28,18 @@ pub fn run(args: &[String]) {
         std::process::exit(2);
     };
     let (mut lang_arg, mut spec) = (None::<String>, Spec::DEFAULT);
+    let (mut lora_path, mut strength) = (None::<String>, 1.0f32);
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match (a.as_str(), it.next()) {
             ("--lang", Some(l)) => lang_arg = Some(l.clone()),
+            ("--lora", Some(p)) => lora_path = Some(p.clone()),
+            ("--lora-strength", Some(x)) => {
+                strength = x.parse().unwrap_or_else(|_| {
+                    eprintln!("--lora-strength takes a number");
+                    std::process::exit(2)
+                })
+            }
             ("--spec", Some(s)) => {
                 spec = match s.as_str() {
                     "guide" => Spec::Guide,
@@ -55,6 +64,20 @@ pub fn run(args: &[String]) {
         std::process::exit(1)
     });
     w.set_spec(spec);
+    let adapter = lora_path.as_deref().map(|p| {
+        load_lora(&w, p).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1)
+        })
+    });
+    let lora = adapter.as_ref().map(|(a, tok)| a.lora(tok));
+    if let Some(l) = &lora {
+        if let Err(e) = w.set_lora(Some(l)) {
+            eprintln!("{}: {e}", lora_path.as_deref().unwrap_or(""));
+            std::process::exit(1);
+        }
+        w.lora_strength = strength;
+    }
     let lang = resolve_lang(&w, lang_arg.as_deref()).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(2)

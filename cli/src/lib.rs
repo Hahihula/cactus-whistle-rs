@@ -1,6 +1,7 @@
 //! Helpers shared by the `whistle` binary and the tests.
 
 pub mod audio;
+pub mod lora;
 
 pub use audio::load;
 
@@ -23,4 +24,13 @@ pub fn resolve_lang(w: &Whistle, code: Option<&str>) -> Result<Option<usize>, St
             )
         }),
     }
+}
+
+/// Read the adapter at `path` for model `w`: the adapter and the extended
+/// tokenizer the engine's [`cactus_whistle::Lora`] borrows (see
+/// [`lora::Adapter::lora`]).
+pub fn load_lora(w: &Whistle, path: &str) -> Result<(lora::Adapter, Vec<u8>), String> {
+    let adapter = lora::Adapter::load(path)?;
+    let tokenizer = adapter.tokenizer(w).map_err(|e| format!("{path}: {e}"))?;
+    Ok((adapter, tokenizer))
 }

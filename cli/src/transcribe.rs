@@ -7,7 +7,7 @@
 use std::time::Instant;
 
 use cactus_whistle::Whistle;
-use cactus_whistle_cli::{lang_codes, load, resolve_lang};
+use cactus_whistle_cli::{lang_codes, load, load_lora, resolve_lang};
 
 pub const USAGE: &str = "\
 whistle transcribe MODEL.cact AUDIO [options]
@@ -19,6 +19,10 @@ whistle transcribe MODEL.cact AUDIO [options]
                      fast:  the same front end, greedy decoding
                      c:     the C engine's behaviour (andrisgauracs/whistle-esp32)
   --depth N          use N decoder layers of an untrimmed model
+  --lora ADAPTER     run with a LoRA adapter (.safetensors from `needle whistle
+                     finetune`) on its base model, without building a merged .cact
+  --lora-strength X  scale the adapter's update (default 1; 0 = base model with the
+                     adapter's tokens)
   --beam N, --front blog|c, --pe memory|c
                      override single fields of the spec
 debugging:
@@ -41,12 +45,21 @@ pub fn run(args: &[String]) {
     let (mut lg_out, mut toks_arg) = (None::<String>, None::<String>);
     let (mut front, mut pe, mut beam) = (None::<bool>, None::<bool>, None::<usize>);
     let mut spec = None::<cactus_whistle::Spec>;
+    let (mut lora_path, mut lora_strength) = (None::<String>, 1.0f32);
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--lang" if i + 1 < args.len() => {
                 i += 1;
                 lang_arg = Some(args[i].clone());
+            }
+            "--lora" if i + 1 < args.len() => {
+                i += 1;
+                lora_path = Some(args[i].clone());
+            }
+            "--lora-strength" if i + 1 < args.len() => {
+                i += 1;
+                lora_strength = args[i].parse().expect("lora strength");
             }
             "--depth" if i + 1 < args.len() => {
                 i += 1;
@@ -134,6 +147,29 @@ pub fn run(args: &[String]) {
             std::process::exit(1);
         }
     };
+    let adapter = lora_path.as_deref().map(|p| {
+        load_lora(&w, p).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1)
+        })
+    });
+    let lora = adapter.as_ref().map(|(a, tok)| a.lora(tok));
+    if let Some(l) = &lora {
+        if let Err(e) = w.set_lora(Some(l)) {
+            eprintln!("{}: {e}", lora_path.as_deref().unwrap_or(""));
+            std::process::exit(1);
+        }
+        w.lora_strength = lora_strength;
+        let (a, _) = adapter.as_ref().unwrap();
+        eprintln!(
+            "lora  rank {}  scale {}  strength {lora_strength}  {} projections  +{} pieces  languages {}",
+            a.rank,
+            a.scale,
+            a.updates.len(),
+            a.pieces.len(),
+            lang_codes(&w).join(",")
+        );
+    }
     let lang = resolve_lang(&w, lang_arg.as_deref()).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(2)

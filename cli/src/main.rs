@@ -4,7 +4,9 @@
 //!     whistle listen MODEL.cact [options]
 //!     whistle trim MODEL.cact DEPTH OUT.cact
 //!     whistle info MODEL.cact
+//!     whistle eval MODEL.cact SPLIT.jsonl --out HYP.jsonl [options]
 
+mod eval;
 mod info;
 mod listen;
 mod transcribe;
@@ -17,6 +19,7 @@ whistle: Cactus Whistle speech recognition in Rust
   whistle listen MODEL.cact [options]                push to talk from the microphone
   whistle trim MODEL.cact DEPTH OUT.cact             keep DEPTH decoder layers (2..8)
   whistle info MODEL.cact                            header, tensors, trimmed sizes
+  whistle eval MODEL.cact SPLIT.jsonl --out HYP.jsonl  transcribe a dataset split on every core
 
 `whistle transcribe` with no arguments lists its options.";
 
@@ -31,6 +34,7 @@ fn main() {
         "listen" => listen::run(rest),
         "trim" => trim::run(rest),
         "info" => info::run(rest),
+        "eval" => eval::run(rest),
         "-h" | "--help" | "help" => println!("{USAGE}"),
         other => {
             eprintln!("unknown command {other}\n\n{USAGE}");

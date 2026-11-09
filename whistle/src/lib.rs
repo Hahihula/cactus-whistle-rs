@@ -22,6 +22,7 @@ extern crate std;
 
 pub mod cact;
 pub mod ladder;
+pub mod lora;
 pub mod math;
 pub mod model;
 pub mod par;
@@ -35,4 +36,5 @@ pub mod bench {
     pub use crate::model::kron;
 }
 
+pub use lora::Lora;
 pub use model::{Error, LANGS, MAX_LANGS, N_LANGS, Session, Spec, Whistle, find_speech};

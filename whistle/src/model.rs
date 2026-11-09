@@ -33,6 +33,7 @@ pub const N_LANGS: usize = 7;
 /// Most languages a model may have (one bit each in [`Whistle::lang_mask`]).
 pub const MAX_LANGS: usize = 32;
 use crate::ladder::MAX_LAYERS;
+use crate::lora::{Lora, Proj, Site};
 const SINKHORN: usize = 20;
 const EG_HIST: usize = 16;
 const EG_SEED: u32 = 0x9E37_79B9;
@@ -173,6 +174,29 @@ impl Spec {
     }
 }
 
+/// The language tags of a tokenizer with `vocab` pieces: the trailing
+/// `<|xx|>` pieces. Returns the first tag's id and the number of tags.
+fn lang_tags(tok: &Tokenizer, vocab: usize) -> Option<(u32, usize)> {
+    if tok.len() != vocab {
+        return None;
+    }
+    let is_tag = |id: usize| {
+        let s = tok.piece(id as u32);
+        s.len() > 4 && s.starts_with(b"<|") && s.ends_with(b"|>") && core::str::from_utf8(s).is_ok()
+    };
+    let n = (0..vocab).rev().take_while(|&id| is_tag(id)).count();
+    if n == 0 || n > MAX_LANGS || n >= vocab {
+        return None;
+    }
+    Some(((vocab - n) as u32, n))
+}
+
+/// Where a token's embedding row is when an adapter extends the vocabulary.
+enum Row {
+    Base(usize),
+    Lora(usize),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     Cact(CactError),
@@ -183,6 +207,8 @@ pub enum Error {
     BadDepth,
     ClipTooShort,
     BadLanguage,
+    /// The adapter doesn't fit the model (shapes, layers or vocabulary).
+    BadLora,
 }
 
 impl From<CactError> for Error {
@@ -208,6 +234,9 @@ impl core::fmt::Display for Error {
             }
             Error::ClipTooShort => f.write_str("audio too short to transcribe"),
             Error::BadLanguage => f.write_str("language index is not one of the model's languages"),
+            Error::BadLora => f.write_str(
+                "adapter doesn't fit this model (fine-tuned from another base, or a different shape)",
+            ),
         }
     }
 }
@@ -344,6 +373,19 @@ pub struct Whistle<'a> {
     pub pe_memory: bool,
     /// Beam width: 1 is greedy (the C engine), 5 is the official engine.
     pub beams: usize,
+
+    i_tok: usize,
+    /// The model's own vocabulary, before an adapter extends it.
+    base_vocab: usize,
+    base_lang_base: u32,
+    base_n_langs: usize,
+    lora: Option<&'a Lora<'a>>,
+    /// Adapter layer of each decoder layer in the file (a trimmed model keeps
+    /// only some of the layers the adapter was trained on).
+    lora_dec: [usize; MAX_LAYERS],
+    /// Multiplies the adapter's update (not its vocabulary rows): 0 is the
+    /// base model, 1 the adapter as trained.
+    pub lora_strength: f32,
 }
 
 impl<'a> Whistle<'a> {
@@ -826,10 +868,14 @@ impl<'a> Whistle<'a> {
         let mut tmp = [0f32; 64];
         let scale = 1.0 / sqrtf(qk as f32);
 
+        let layer = (l - self.i_enc) / E_N;
         let a = self.act(l + E_Q, xn, rows);
         self.gemm(l + E_Q, &a, &mut q);
         self.gemm(l + E_K, &a, &mut k);
         self.gemm(l + E_V, &a, &mut v);
+        self.lora_add(Site::Encoder, Proj::Q, layer, xn, rows, &mut q);
+        self.lora_add(Site::Encoder, Proj::K, layer, xn, rows, &mut k);
+        self.lora_add(Site::Encoder, Proj::V, layer, xn, rows, &mut v);
         for t in 0..rows {
             for h in 0..nh {
                 let z = &mut q[(t * nh + h) * qk..(t * nh + h + 1) * qk];
@@ -881,10 +927,12 @@ impl<'a> Whistle<'a> {
         }
         drop(attn);
         self.gemm(l + E_GATE, &a, &mut g);
+        self.lora_add(Site::Encoder, Proj::Gate, layer, xn, rows, &mut g);
         for (ov, gv) in o.iter_mut().zip(g.iter()) {
             *ov *= sigm(*gv);
         }
-        let y = self.lin(l + E_OUT, &o, rows);
+        let mut y = self.lin(l + E_OUT, &o, rows);
+        self.lora_add(Site::Encoder, Proj::Out, layer, &o, rows, &mut y);
         out[..y.len()].copy_from_slice(&y);
     }
 
@@ -1174,6 +1222,11 @@ impl<'a> Whistle<'a> {
             self.gemm(l + D_K, &a, &mut tk);
             self.gemm(l + D_V, &a, &mut tv);
             self.gemm(l + D_GATE, &a, &mut gt);
+            // Before the Q/K/V conv: the adapter updates the projection kernels.
+            self.lora_add(Site::DecoderSelf, Proj::Q, layer, &xn, bsz, &mut tq);
+            self.lora_add(Site::DecoderSelf, Proj::K, layer, &xn, bsz, &mut tk);
+            self.lora_add(Site::DecoderSelf, Proj::V, layer, &xn, bsz, &mut tv);
+            self.lora_add(Site::DecoderSelf, Proj::Gate, layer, &xn, bsz, &mut gt);
             for b in 0..bsz {
                 let r = &mut raw[b * nraw..(b + 1) * nraw];
                 r[..nq].copy_from_slice(&tq[b * nq..(b + 1) * nq]);
@@ -1253,7 +1306,8 @@ impl<'a> Whistle<'a> {
         for (ov, gv) in o.iter_mut().zip(gt.iter()) {
             *ov *= sigm(*gv);
         }
-        let t2 = self.lin(l + D_OUT, &o, bsz);
+        let mut t2 = self.lin(l + D_OUT, &o, bsz);
+        self.lora_add(Site::DecoderSelf, Proj::Out, layer, &o, bsz, &mut t2);
         let g = sigm(self.hv(l + D_AGATE, 0));
         for b in 0..bsz {
             self.zc(&t2[b * d..(b + 1) * d], l + D_POST, &mut tmpd[..d]);
@@ -1276,6 +1330,8 @@ impl<'a> Whistle<'a> {
             let a = self.act(xi + X_Q, &xn, bsz);
             self.gemm(xi + X_Q, &a, &mut cq);
             self.gemm(xi + X_GATE, &a, &mut gt);
+            self.lora_add(Site::Cross, Proj::Q, layer, &xn, bsz, &mut cq);
+            self.lora_add(Site::Cross, Proj::Gate, layer, &xn, bsz, &mut gt);
         }
         for (b, s) in ss.iter_mut().enumerate() {
             let et = s.enc_t;
@@ -1310,7 +1366,8 @@ impl<'a> Whistle<'a> {
         for (ov, gv) in o.iter_mut().zip(gt.iter()) {
             *ov *= sigm(*gv);
         }
-        let t2 = self.lin(xi + X_OUT, &o, bsz);
+        let mut t2 = self.lin(xi + X_OUT, &o, bsz);
+        self.lora_add(Site::Cross, Proj::Out, layer, &o, bsz, &mut t2);
         let g = sigm(self.hv(xi + X_GATE_S, 0));
         for b in 0..bsz {
             self.zc(&t2[b * d..(b + 1) * d], xi + X_POST, &mut tmpd[..d]);
@@ -1369,6 +1426,8 @@ impl<'a> Whistle<'a> {
             let a = self.act(xi + X_K, enc, t);
             self.gemm(xi + X_K, &a, &mut k);
             self.gemm(xi + X_V, &a, &mut v);
+            self.lora_add(Site::Cross, Proj::K, l, enc, t, &mut k);
+            self.lora_add(Site::Cross, Proj::V, l, enc, t, &mut v);
             for si in 0..t {
                 for h in 0..nh {
                     let kb = (si * nh + h) * qk;
@@ -1405,14 +1464,13 @@ impl<'a> Whistle<'a> {
         let sd = sqrtf(d as f32);
         for b in 0..bsz {
             let xb = &mut x[b * d..(b + 1) * d];
-            dequant_row(
-                &self.c,
-                e,
-                self.p[self.i_emb],
-                toks[b] as usize,
-                &mut row,
-                xb,
-            );
+            match self.row_of(toks[b] as usize) {
+                Row::Base(i) => dequant_row(&self.c, e, self.p[self.i_emb], i, &mut row, xb),
+                Row::Lora(j) => {
+                    let rows = self.lora.map_or(&[][..], |l| l.rows);
+                    xb.copy_from_slice(&rows[j * d..(j + 1) * d]);
+                }
+            }
             for v in xb.iter_mut() {
                 *v *= sd;
             }
@@ -1445,7 +1503,27 @@ impl<'a> Whistle<'a> {
     /// Logits for `bsz` hidden states at once, [beam][vocab].
     pub fn logits_batch(&self, hid: &[f32], bsz: usize) -> Vec<f32> {
         let _s = prof::span(prof::HEAD);
-        self.lin(self.i_emb, &hid[..bsz * self.d], bsz)
+        let base = self.lin(self.i_emb, &hid[..bsz * self.d], bsz);
+        let Some(l) = self.lora else {
+            return base;
+        };
+        // Tied head over the extended vocabulary: the adapter's rows give the
+        // logits of the tokens and languages it adds.
+        let (d, bv, v) = (self.d, self.base_vocab, self.vocab);
+        let mut out = vec![0f32; bsz * v];
+        for b in 0..bsz {
+            let h = &hid[b * d..(b + 1) * d];
+            for id in 0..v {
+                out[b * v + id] = match self.row_of(id) {
+                    Row::Base(i) => base[b * bv + i],
+                    Row::Lora(j) => {
+                        let r = &l.rows[j * d..(j + 1) * d];
+                        r.iter().zip(h).map(|(&a, &x)| a * x).sum()
+                    }
+                };
+            }
+        }
+        out
     }
 
     /// One greedy pass in `lang` from BOS. Returns ids and the mean log-prob.
@@ -1717,6 +1795,175 @@ impl<'a> Whistle<'a> {
         self.p[self.i_emb] = b;
     }
 
+    // ------------------------------------------------------------- LoRA
+
+    /// The model's own tokenizer blob (before an adapter extends it), for
+    /// [`crate::tokenizer::extend`].
+    pub fn tokenizer_blob(&self) -> &'a [u8] {
+        self.p[self.i_tok]
+    }
+
+    /// Number of text pieces of the model's own vocabulary (8192 for the
+    /// shipped model); an adapter's pieces go after them.
+    pub fn base_text_pieces(&self) -> usize {
+        self.base_lang_base as usize
+    }
+
+    /// Codes of the model's own languages, before an adapter adds any.
+    pub fn base_lang_code(&self, i: usize) -> &'a str {
+        if i >= self.base_n_langs {
+            return "";
+        }
+        let piece = Tokenizer::new(self.p[self.i_tok])
+            .map(|t| t.piece(self.base_lang_base + i as u32))
+            .unwrap_or(&[]);
+        if piece.len() < 4 {
+            return "";
+        }
+        core::str::from_utf8(&piece[2..piece.len() - 2]).unwrap_or("")
+    }
+
+    /// Engine tensor of projection `proj` at `site` in layer 0 and the stride
+    /// to the next layer.
+    fn proj_tensor(&self, site: Site, proj: Proj) -> (usize, usize) {
+        let p = proj as usize;
+        match site {
+            Site::Encoder => (self.i_enc + [E_Q, E_K, E_V, E_GATE, E_OUT][p], E_N),
+            Site::DecoderSelf => (self.i_dec + [D_Q, D_K, D_V, D_GATE, D_OUT][p], D_N),
+            Site::Cross => (self.i_cross + [X_Q, X_K, X_V, X_GATE, X_OUT][p], X_N),
+        }
+    }
+
+    /// Run with an adapter (`None`: the base model again). Checks that it fits
+    /// the model: projection shapes, layer counts (an adapter trained on 8
+    /// decoder layers runs on a model trimmed to fewer, as on the ladder), and
+    /// that its tokenizer extends this model's.
+    pub fn set_lora(&mut self, lora: Option<&'a Lora<'a>>) -> Result<(), Error> {
+        let Some(l) = lora else {
+            self.lora = None;
+            self.tok = Tokenizer::new(self.p[self.i_tok]).ok_or(Error::Tokenizer)?;
+            self.vocab = self.base_vocab;
+            self.lang_base = self.base_lang_base;
+            self.n_langs = self.base_n_langs;
+            return Ok(());
+        };
+        let mut dec_layers = None;
+        for site in crate::lora::SITES {
+            for proj in crate::lora::PROJS {
+                let Some(w) = l.weight(site, proj) else {
+                    continue;
+                };
+                let (ti, _) = self.proj_tensor(site, proj);
+                let t = &self.t[ti];
+                if !w.valid() || w.din != t.shape[1] as usize || w.dout != t.shape[0] as usize {
+                    return Err(Error::BadLora);
+                }
+                if site == Site::Encoder {
+                    if w.layers != self.enc_layers {
+                        return Err(Error::BadLora);
+                    }
+                } else if *dec_layers.get_or_insert(w.layers) != w.layers {
+                    return Err(Error::BadLora);
+                }
+            }
+        }
+        let mut map = [0usize; MAX_LAYERS];
+        match dec_layers {
+            Some(n) if n == self.dec_layers => {
+                for (i, m) in map.iter_mut().enumerate() {
+                    *m = i;
+                }
+            }
+            Some(n) if n > self.dec_layers && n <= MAX_LAYERS => {
+                // A trimmed model keeps the ladder's layers, in order.
+                let keep = crate::ladder::layers_for(n, self.dec_layers);
+                map[..keep.len()].copy_from_slice(&keep);
+            }
+            Some(_) => return Err(Error::BadLora),
+            None => {}
+        }
+
+        // Vocabulary: base text, added pieces, base tags, added tags.
+        let d = self.d;
+        if l.rows.len() % d != 0 || l.pieces > l.rows.len() / d {
+            return Err(Error::BadLora);
+        }
+        let added_langs = l.rows.len() / d - l.pieces;
+        let vocab = self.base_vocab + l.rows.len() / d;
+        let tok = Tokenizer::new(l.tokenizer).ok_or(Error::BadLora)?;
+        let (lang_base, n_langs) = lang_tags(&tok, vocab).ok_or(Error::BadLora)?;
+        if lang_base != self.base_lang_base + l.pieces as u32
+            || n_langs != self.base_n_langs + added_langs
+        {
+            return Err(Error::BadLora);
+        }
+        let base_tok = Tokenizer::new(self.p[self.i_tok]).ok_or(Error::Tokenizer)?;
+        for i in 0..self.base_n_langs {
+            if tok.piece(lang_base + i as u32) != base_tok.piece(self.base_lang_base + i as u32) {
+                return Err(Error::BadLora);
+            }
+        }
+        self.lora = Some(l);
+        self.lora_dec = map;
+        self.tok = tok;
+        self.vocab = vocab;
+        self.lang_base = lang_base;
+        self.n_langs = n_langs;
+        Ok(())
+    }
+
+    /// The adapter in use, if any.
+    pub fn lora(&self) -> Option<&'a Lora<'a>> {
+        self.lora
+    }
+
+    /// `y += strength * scale * (x @ A) @ B` for one projection, if the
+    /// adapter has it. `layer` is the layer in the file.
+    fn lora_add(
+        &self,
+        site: Site,
+        proj: Proj,
+        layer: usize,
+        x: &[f32],
+        rows: usize,
+        y: &mut [f32],
+    ) {
+        let Some(l) = self.lora else {
+            return;
+        };
+        let Some(w) = l.weight(site, proj) else {
+            return;
+        };
+        let scale = l.scale * self.lora_strength;
+        if scale == 0.0 {
+            return;
+        }
+        let layer = if site == Site::Encoder {
+            layer
+        } else {
+            self.lora_dec[layer]
+        };
+        let _s = prof::span(prof::LIN);
+        w.apply(layer, scale, x, rows, y);
+    }
+
+    /// Where token `id`'s embedding row is.
+    fn row_of(&self, id: usize) -> Row {
+        let Some(l) = self.lora else {
+            return Row::Base(id);
+        };
+        let (text, p, tags) = (self.base_lang_base as usize, l.pieces, self.base_n_langs);
+        if id < text {
+            Row::Base(id)
+        } else if id < text + p {
+            Row::Lora(id - text)
+        } else if id < text + p + tags {
+            Row::Base(id - p)
+        } else {
+            Row::Lora(id - text - tags)
+        }
+    }
+
     pub fn open(blob: &'a [u8]) -> Result<Self, Error> {
         let c = Cact::open(blob)?;
         let h = c.h;
@@ -1815,21 +2062,10 @@ impl<'a> Whistle<'a> {
         // shipped model has 7 after 8192 text pieces, and a fine-tune that adds
         // tokens or languages moves and extends them.
         let vocab = h.vocab_size as usize;
-        if tok.len() != vocab || t[i_emb].shape[0] as usize != vocab {
+        if t[i_emb].shape[0] as usize != vocab {
             return Err(Error::Tokenizer);
         }
-        let is_tag = |id: usize| {
-            let s = tok.piece(id as u32);
-            s.len() > 4
-                && s.starts_with(b"<|")
-                && s.ends_with(b"|>")
-                && core::str::from_utf8(s).is_ok()
-        };
-        let n_langs = (0..vocab).rev().take_while(|&id| is_tag(id)).count();
-        if n_langs == 0 || n_langs > MAX_LANGS || n_langs >= vocab {
-            return Err(Error::Tokenizer);
-        }
-        let lang_base = (vocab - n_langs) as u32;
+        let (lang_base, n_langs) = lang_tags(&tok, vocab).ok_or(Error::Tokenizer)?;
         let h16 = t
             .iter()
             .zip(&p)
@@ -1890,6 +2126,13 @@ impl<'a> Whistle<'a> {
             i_enc_final,
             i_stem,
             i_melfb,
+            i_tok,
+            base_vocab: vocab,
+            base_lang_base: lang_base,
+            base_n_langs: n_langs,
+            lora: None,
+            lora_dec: [0; MAX_LAYERS],
+            lora_strength: 1.0,
             depth: 0,
             active: [0; MAX_LAYERS],
             lang: 0,
