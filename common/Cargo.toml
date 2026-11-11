@@ -11,6 +11,7 @@ publish      = false
 [dependencies]
 cactus-whistle = { path = "../whistle", features = ["std"] }
 symphonia = { version = "0.6", default-features = false, features = ["mp3", "ogg", "vorbis", "flac", "wav", "pcm", "aac", "isomp4"] }
+half = "2"
 libm = "0.2"
 safetensors = "0.8.0"
 serde = "1.0.229"

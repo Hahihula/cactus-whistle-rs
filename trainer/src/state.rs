@@ -1,7 +1,7 @@
 //! What the TUI shows, rebuilt from the runs' `events.jsonl` files: the same
 //! code serves `run` (which writes them) and `watch` (which only reads).
 //!
-//! Event sources: the Python trainer (`log`, `start`, `step`, `eval`,
+//! Event sources: the trainer (`log`, `start`, `step`, `eval`,
 //! `early_stop`, `stopped`, `done`, `error`), the runner (`status`, `stderr`,
 //! `built`) and the evaluator (`wer`, `samples`, `test`). The runner adds `t`
 //! (Unix seconds) to every event.

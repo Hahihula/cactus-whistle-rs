@@ -3,9 +3,7 @@
 #        whistle-train run sweep.toml --headless  then  whistle-train watch runs_v4
 
 out_dir = "runs_v4"
-# A Python with cactus-needle 3.2.8 and JAX (pip install "cactus-compute[train]").
-python = ".venv/bin/python"
-# Also write tuned_<run>.cact with `needle whistle build` after each run.
+# Also write tuned_<run>.cact (the best adapter merged, 4-bit) after each run.
 build = false
 # Kill a run whose trainer printed nothing for this long (a hung CUDA crash).
 stall_minutes = 30
@@ -19,11 +17,14 @@ test = "dataset_v2/test.jsonl"     # optional: WER of each run's best adapter at
 tokens = "tokens.txt"
 language = "cs"
 base = "checkpoints/whistle.safetensors"
+# The published model: built models copy its tokenizer, mel filterbank and
+# Hadamard permutations (needed for base_cact below and for build = true).
+template = "model/whistle.cact"
 
 # Evaluation with the Rust engine and runtime LoRA, on the CPU, at every checkpoint.
 [eval]
 # 4-bit export of the float base (adapters need it; the published 2-bit
-# whistle.cact transcribes far worse). Built with needle if missing.
+# whistle.cact transcribes far worse). Built from base + template if missing.
 base_cact = "model/whistle_w4.cact"
 clips = 200            # validation clips decoded per checkpoint for WER; 0 = off
 threads = 6            # CPU threads; leave some for the trainer

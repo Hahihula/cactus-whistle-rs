@@ -92,6 +92,8 @@ impl Evaluator {
         let p2 = pending.clone();
         let tests = test_path.is_some();
         let handle = std::thread::spawn(move || {
+            // The E-cores of a hybrid CPU; the trainer has the P-cores.
+            crate::affinity::efficiency_cores();
             let ctx = Ctx {
                 blob,
                 spec,

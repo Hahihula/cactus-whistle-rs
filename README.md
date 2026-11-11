@@ -18,9 +18,11 @@ codebook weights and is 14.5 MB with 4 of its 8 decoder layers, small enough for
 - **`whistle-train`** (`trainer/`): LoRA fine-tuning with sweeps, live evaluation with
   the Rust engine and a training dashboard (see [Fine-tuning](#fine-tuning)).
 - **`cactus-whistle-common`** (`common/`): desktop code the two binaries share (audio
-  files, adapters, datasets, WER).
-- **`tools/`**: test clips, an evaluation against Cactus's official engine, and an
-  optional comparison with the C engine this port started from.
+  files, adapters, datasets, WER, the SentencePiece encoder, and writing `.cact` models
+  from the float checkpoint).
+- **`tools/`**: test clips, an evaluation against Cactus's official engine, an
+  optional comparison with the C engine this port started from, and a check of the
+  trainer against Cactus's JAX code (`train_parity/`; development only).
 
 ## Quick start
 
@@ -56,20 +58,22 @@ whistle transcribe MODEL.cact AUDIO [options]   speech to text from a file
 whistle listen MODEL.cact [options]             push to talk from the microphone
 whistle trim MODEL.cact DEPTH OUT.cact          keep DEPTH decoder layers
 whistle info MODEL.cact                         header, tensors, trimmed sizes
+whistle eval MODEL.cact SPLIT.jsonl --out HYP.jsonl   transcribe a dataset split
+whistle build CHECKPOINT.safetensors --template whistle.cact --out MODEL.cact [--lora A] [--depth N]
 ```
 
 The CLI's extra dependencies (`symphonia` to decode files, `cpal` for the
 microphone) are only in the `cactus-whistle-cli` package; the engine stays
 dependency-free.
 
-Models fine-tuned with Cactus's tooling (`needle whistle finetune` + `build`) work too,
+Fine-tuned models (from `whistle-train` and `whistle build`, or Cactus's `needle`) work too,
 including ones that add tokens or a new language: the engine reads the model's languages
 from its tokenizer, so `--lang cs` and detection work on a model that adds Czech.
 
 ### LoRA adapters without merging
 
 `--lora adapter.safetensors` runs a fine-tuning adapter on its base model, so there's
-no `needle whistle build` between training and listening; `--lora-strength X` scales its
+no build step between training and listening; `--lora-strength X` scales its
 update (1 = as trained, 0 = the base model with the adapter's tokens and languages):
 
 ```bash
@@ -79,23 +83,26 @@ whistle listen model/whistle_w4.cact --lora adapter.safetensors
 
 The base must be a **4-bit** export of the float checkpoint the adapter was trained from,
 since training simulates that quantisation. The published `whistle.cact` has 2-bit
-weights, and an adapter on it transcribes noticeably worse. Until this repository can
-export one itself, `needle` writes it from an empty adapter:
+weights, and an adapter on it transcribes noticeably worse. `whistle build` writes it
+from the float checkpoint (`checkpoints/whistle.safetensors` from Cactus), copying the
+tokenizer and the other fixed tables from the published model:
 
 ```bash
-python -c "from needle.model.checkpoints import write_adapter; write_adapter('empty.safetensors', \
-  {'lora': {}, 'rows': None, 'scale': 1.0, 'base': 'checkpoints/whistle.safetensors', 'rank': 0, \
-   'seed': 0, 'pieces': [], 'languages': ['en','de','fr','es','it','nl','pl']})"
-needle whistle build --lora empty.safetensors --out model/whistle_w4.cact
+whistle build checkpoints/whistle.safetensors --template model/whistle.cact --out model/whistle_w4.cact
 ```
 
-The engine adds the update in float beside each int8 matmul, while `needle whistle
-build` merges it into the weights before quantising, so the two give close but not
-identical transcripts. A model trimmed with `whistle trim` takes an adapter trained on all
+The engine adds the update in float beside each int8 matmul, while `whistle build --lora`
+merges it into the weights before quantising (the way the model was trained), so the two
+give close but not identical transcripts. A model trimmed with `whistle trim` takes an adapter trained on all
 8 decoder layers.
 
 `whistle eval MODEL.cact SPLIT.jsonl --out HYP.jsonl [--lora ...]` transcribes a dataset
 split in the fine-tuning JSONL format on every core and writes the hypotheses.
+
+`whistle build` is Rust's `needle whistle build`: the float checkpoint, optionally with an
+adapter merged in (and its added tokens and languages in the tokenizer), quantised to the
+4-bit codebook format. Its output matches `needle`'s byte for byte except where float
+rounding lands on a quantisation boundary (61 of 29 M bytes for the base model).
 
 `transcribe` and `listen` options: `--lang xx` forces a language (default: detect), `--spec
 guide|fast|c` picks the behaviour (see [Specs](#specs)), and `--depth N` runs N
@@ -132,11 +139,17 @@ whistle-train run sweep.toml --headless # or without the dashboard (tmux, ssh) .
 whistle-train watch runs_v4             # ... and watch it from anywhere
 ```
 
-The training itself runs on the GPU in Python: `trainer/python/whistle_train.py`
-reimplements `needle whistle finetune` on the model code of `cactus-needle` 3.2.8 (`pip
-install "cactus-compute[train]"`). With default settings it trains the same way
-(same schedule, same numerics; validation losses agree to GPU noise). It adds the
-settings the `needle` CLI lacks:
+Training runs on the GPU in Rust with [burn](https://github.com/tracel-ai/burn) (CUDA by
+default; `cargo build --release -p whistle-train --no-default-features --features wgpu`
+for Vulkan, Metal or DX12). It reproduces `needle whistle finetune` (cactus-needle 3.2.8):
+the same model, the same quantisation-aware numerics (CQ-W4 straight-through weights,
+int8 activations), the same optimiser and schedule. Checked against needle's JAX code on
+one batch, the loss agrees to 2e-5 and every gradient to under 1% without activation
+quantisation (with it, JAX disagrees with itself by as much between runs: int8 rounding
+makes the quantised forward chaotic). A full rerun of the best sweep-4 run (r32, robust
+augmentation, 27k steps on an RTX 3090) reached validation loss 0.1824 against JAX's 0.1876
+and test WER 19.0% against 19.4%, at 0.314 s/step against 0.307. A batch is cut to its longest clip and transcript (JAX pads every one to 30 s and 320
+tokens), which leaves the result unchanged. It adds the settings the `needle` CLI lacks:
 
 - **optimiser:** weight decay (separately for the adapter and the new vocabulary rows),
   the rows' learning rate, warmup, schedule (cosine, linear, constant) and its floor,
@@ -160,9 +173,18 @@ tokens, ...) and the log. A run that goes silent (a hung CUDA crash) is killed, 
 GPU is checked before each run.
 
 Each run writes `runs_v4/<run>/`: `events.jsonl` (everything the dashboard shows),
-`config.json`, the exact `whistle_train.py` it ran, `checkpoints/`, `adapter_best` and
-`adapter_last`, `test_hyp.jsonl`, and with `build = true` a merged `tuned_<run>.cact`.
-`trainer/sweep.example.toml` documents every setting.
+`config.json`, `checkpoints/`, `adapter_best` and `adapter_last` (needle's adapter format),
+`state.safetensors` (for resuming), `test_hyp.jsonl`, and with `build = true` a merged
+`tuned_<run>.cact`. `trainer/sweep.example.toml` documents every setting. The sweep needs
+the float checkpoint (`base`) and the published `whistle.cact` (`template`), whose
+tokenizer and tables the trainer and `whistle build` reuse.
+
+The trainer needs Rust 1.95 or newer (burn's minimum; the engine itself builds with
+1.87). The first steps of a run compile and benchmark GPU kernels; the results are
+cached on disk, so later runs start within seconds. On hybrid Intel CPUs (P- and E-cores)
+the trainer is kept on the P-cores and the evaluator on the E-cores, since the trainer's
+speed follows the core its kernel-dispatch thread runs on (`WHISTLE_NO_PIN=1` turns this
+off).
 
 ## Using the library
 

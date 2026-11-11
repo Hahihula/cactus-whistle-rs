@@ -2,13 +2,24 @@
 name         = "whistle-train"
 description  = "Fine-tune Cactus Whistle with LoRA: sweeps, live evaluation with the Rust engine, and a training TUI"
 edition.workspace      = true
-rust-version.workspace = true
+# burn needs a newer Rust than the engine (whose MCU users stay on 1.87).
+rust-version = "1.95"
 version.workspace      = true
 license.workspace      = true
 repository.workspace   = true
 publish      = false
 
+[features]
+default = ["cuda"]
+# GPU backends for the trainer: NVIDIA (CUDA) and, portable, wgpu (Vulkan, Metal, DX12).
+cuda = ["burn/cuda"]
+wgpu = ["burn/wgpu"]
+
 [dependencies]
+burn = { version = "0.22.1", default-features = false, features = ["std", "autodiff", "fusion", "autotune", "persistence"] }
+half = "2"
+rustfft = "6"
+safetensors = "0.8.0"
 cactus-whistle = { path = "../whistle", features = ["std"] }
 cactus-whistle-common = { path = "../common" }
 crossterm = "0.29.0"

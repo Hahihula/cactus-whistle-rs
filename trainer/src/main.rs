@@ -4,11 +4,13 @@
 //!     whistle-train watch RUNS_DIR
 //!     whistle-train example > sweep.toml
 
+mod affinity;
 mod config;
 mod evaluator;
 mod hints;
 mod runner;
 mod state;
+mod train;
 mod tui;
 
 use std::path::Path;
@@ -27,8 +29,8 @@ whistle-train: LoRA fine-tuning of Cactus Whistle
   whistle-train example                    print an example sweep file
 
 Finished runs are skipped and stopped ones resume, so `run` can be repeated after a crash or a stop.
-Training runs `python` from the sweep file (cactus-needle 3.2.8 with JAX); evaluation runs the Rust
-engine with runtime LoRA on the CPU.";
+Training runs on the GPU (burn: CUDA, or wgpu when built with --features wgpu); evaluation runs the
+Rust engine with runtime LoRA on the CPU.";
 
 const EXAMPLE: &str = include_str!("../sweep.example.toml");
 
@@ -46,6 +48,8 @@ fn main() {
             }
         }
         Some("example") => print!("{EXAMPLE}"),
+        Some("train") => std::process::exit(train::main(&args[1..])),
+        Some("parity") => train::parity::run(&args[1..]).unwrap_or_else(|e| die(&e)),
         Some("-h" | "--help" | "help") => println!("{USAGE}"),
         _ => {
             eprintln!("{USAGE}");
@@ -85,8 +89,12 @@ fn run(path: &str, opts: &[String]) {
             names.join(", ")
         ));
     }
-    if !sweep.python.exists() && sweep.python.components().count() > 1 {
-        die(&format!("python {} does not exist", sweep.python.display()));
+    match &sweep.data.template {
+        Some(t) if !t.exists() => die(&format!("[data] template {} does not exist", t.display())),
+        None => die(
+            "[data] template is missing: the published whistle.cact (tokenizer, mel filterbank)",
+        ),
+        _ => {}
     }
     let ctl = Arc::new(runner::Control::default());
 

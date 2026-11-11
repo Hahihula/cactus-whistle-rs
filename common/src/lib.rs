@@ -3,8 +3,12 @@
 //! that needs files, threads or parsing lives here.
 
 pub mod audio;
+pub mod checkpoint;
+pub mod cq;
 pub mod dataset;
+pub mod export;
 pub mod lora;
+pub mod spm;
 pub mod wer;
 
 pub use audio::load;

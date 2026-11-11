@@ -2,7 +2,6 @@
 //!
 //! ```toml
 //! out_dir = "runs_v4"
-//! python  = "/path/to/.venv/bin/python"   # with cactus-needle 3.2.8 and JAX
 //!
 //! [data]
 //! train = "dataset_v2/train.jsonl"
@@ -11,9 +10,10 @@
 //! tokens = "tokens.txt"
 //! language = "cs"
 //! base = "checkpoints/whistle.safetensors"
+//! template = "model/whistle.cact"          # the published model: tokenizer, mel, permutations
 //!
 //! [eval]                                   # the Rust engine, on the CPU, per checkpoint
-//! base_cact = "model/whistle_w4.cact"      # built with needle if missing
+//! base_cact = "model/whistle_w4.cact"      # built from base + template if missing
 //! clips = 200
 //! samples = ["cz_jirka.wav", { audio = "pub.wav", text = "reference, if known" }]
 //!
@@ -43,6 +43,10 @@ pub struct Data {
     #[serde(default)]
     pub language: Option<String>,
     pub base: PathBuf,
+    /// A published Whistle `.cact` (whistle.cact): models built from `base`
+    /// copy its tokenizer, mel filterbank and Hadamard permutations.
+    #[serde(default)]
+    pub template: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,10 +117,6 @@ pub struct Eval {
 #[serde(deny_unknown_fields)]
 pub struct Sweep {
     pub out_dir: PathBuf,
-    pub python: PathBuf,
-    /// `needle` executable for building .cact files (default: next to python).
-    #[serde(default)]
-    pub needle: Option<PathBuf>,
     /// Build `tuned_<run>.cact` from the best adapter after each run.
     #[serde(default)]
     pub build: bool,
@@ -167,15 +167,12 @@ impl Sweep {
             }
         };
         s.out_dir = abs(&s.out_dir);
-        if s.python.components().count() > 1 {
-            s.python = abs(&s.python);
-        }
-        s.needle = s.needle.as_ref().map(abs);
         s.data.train = abs(&s.data.train);
         s.data.validation = abs(&s.data.validation);
         s.data.test = s.data.test.as_ref().map(abs);
         s.data.tokens = s.data.tokens.as_ref().map(abs);
         s.data.base = abs(&s.data.base);
+        s.data.template = s.data.template.as_ref().map(abs);
         s.eval.base_cact = abs(&s.eval.base_cact);
         s.eval.sample_list = s
             .eval
@@ -209,10 +206,27 @@ impl Sweep {
         Ok(s)
     }
 
-    pub fn needle(&self) -> PathBuf {
-        self.needle
-            .clone()
-            .unwrap_or_else(|| self.python.with_file_name("needle"))
+    /// Writes `out`: `base` as a 4-bit `.cact`, with `adapter` merged if given.
+    pub fn build_cact(&self, adapter: Option<&Path>, out: &Path) -> Result<(), String> {
+        use cactus_whistle_common::{checkpoint::Checkpoint, export, lora::Adapter};
+        let template = self
+            .data
+            .template
+            .as_ref()
+            .ok_or("[data] template is needed to build models: the published whistle.cact")?;
+        let tpl = std::fs::read(template).map_err(|e| format!("{}: {e}", template.display()))?;
+        let ck = Checkpoint::load(&self.data.base.display().to_string())?;
+        let adapter = match adapter {
+            Some(a) => Some(Adapter::load(&a.display().to_string())?),
+            None => None,
+        };
+        let built = export::build(&ck, adapter.as_ref(), &tpl)?;
+        if let Some(p) = out.parent() {
+            std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        }
+        let tmp = out.with_extension("cact.tmp");
+        std::fs::write(&tmp, &built.blob).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, out).map_err(|e| format!("{}: {e}", out.display()))
     }
 
     pub fn runs(&self) -> Vec<Run> {
@@ -230,7 +244,7 @@ impl Sweep {
             .collect()
     }
 
-    /// The JSON config the Python trainer reads for `run`.
+    /// The JSON config the trainer (`whistle-train train`) reads for `run`.
     pub fn trainer_config(&self, run: &Run) -> serde_json::Value {
         let mut v = serde_json::to_value(&run.settings).unwrap_or_default();
         let m = v.as_object_mut().expect("table");
@@ -238,6 +252,9 @@ impl Sweep {
         m.insert("train".into(), p(&self.data.train));
         m.insert("validation".into(), p(&self.data.validation));
         m.insert("base".into(), p(&self.data.base));
+        if let Some(t) = &self.data.template {
+            m.insert("template".into(), p(t));
+        }
         m.insert("out_dir".into(), p(&self.out_dir.join(&run.name)));
         if let Some(t) = &self.data.tokens {
             m.insert("tokens".into(), p(t));

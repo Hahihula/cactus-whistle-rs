@@ -5,7 +5,9 @@
 //!     whistle trim MODEL.cact DEPTH OUT.cact
 //!     whistle info MODEL.cact
 //!     whistle eval MODEL.cact SPLIT.jsonl --out HYP.jsonl [options]
+//!     whistle build CHECKPOINT.safetensors --template BASE.cact --out MODEL.cact [options]
 
+mod build;
 mod eval;
 mod info;
 mod listen;
@@ -20,6 +22,8 @@ whistle: Cactus Whistle speech recognition in Rust
   whistle trim MODEL.cact DEPTH OUT.cact             keep DEPTH decoder layers (2..8)
   whistle info MODEL.cact                            header, tensors, trimmed sizes
   whistle eval MODEL.cact SPLIT.jsonl --out HYP.jsonl  transcribe a dataset split on every core
+  whistle build CHECKPOINT.safetensors --template BASE.cact --out MODEL.cact [--lora A] [--depth N]
+                                                     a 4-bit model from the float checkpoint
 
 `whistle transcribe` with no arguments lists its options.";
 
@@ -35,6 +39,7 @@ fn main() {
         "trim" => trim::run(rest),
         "info" => info::run(rest),
         "eval" => eval::run(rest),
+        "build" => build::run(rest),
         "-h" | "--help" | "help" => println!("{USAGE}"),
         other => {
             eprintln!("unknown command {other}\n\n{USAGE}");

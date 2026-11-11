@@ -1,4 +1,4 @@
-//! Runs a sweep: one Python trainer process at a time on the GPU, its JSON
+//! Runs a sweep: one trainer process (`whistle-train train`) at a time on the GPU, its JSON
 //! events appended to `<run>/events.jsonl`, checkpoints handed to the
 //! evaluator. A run whose trainer stays silent for `stall_minutes` is killed;
 //! the GPU is checked before every run (a CUDA crash can leave it unusable).
@@ -16,8 +16,6 @@ use serde_json::{Value, json};
 use crate::config::{Run, Sweep};
 use crate::evaluator::{Evaluator, Job};
 use crate::state::append_event;
-
-pub const TRAINER: &str = include_str!("../python/whistle_train.py");
 
 /// Shared with the TUI: ask the runner to stop, see what it is doing.
 #[derive(Default)]
@@ -74,17 +72,7 @@ fn finished(dir: &Path) -> bool {
     })
 }
 
-const EMPTY_ADAPTER: &str = r#"
-import sys
-from needle.model.checkpoints import write_adapter
-from needle.model.whistle import load_whistle
-_, cfg = load_whistle(sys.argv[2])
-write_adapter(sys.argv[1], {"lora": {}, "rows": None, "scale": 1.0, "base": sys.argv[2], "rank": 0,
-                            "seed": 0, "pieces": [], "languages": list(cfg.languages)})
-"#;
-
-/// Make the 4-bit base model the evaluator runs adapters on, if missing:
-/// `needle whistle build` of the float checkpoint with an empty adapter.
+/// Make the 4-bit base model the evaluator runs adapters on, if missing.
 pub fn ensure_eval_base(sweep: &Sweep, ctl: &Control) -> Result<(), String> {
     let out = &sweep.eval.base_cact;
     if out.exists() {
@@ -94,32 +82,7 @@ pub fn ensure_eval_base(sweep: &Sweep, ctl: &Control) -> Result<(), String> {
         "building the 4-bit evaluation base {}",
         out.display()
     ));
-    if let Some(p) = out.parent() {
-        std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
-    }
-    let empty = sweep.out_dir.join("empty_adapter.safetensors");
-    let st = Command::new(&sweep.python)
-        .args(["-I", "-c", EMPTY_ADAPTER])
-        .arg(&empty)
-        .arg(&sweep.data.base)
-        .status()
-        .map_err(|e| format!("{}: {e}", sweep.python.display()))?;
-    if !st.success() {
-        return Err("writing the empty adapter failed".into());
-    }
-    let st = Command::new(sweep.needle())
-        .args(["whistle", "build", "--lora"])
-        .arg(&empty)
-        .arg("--out")
-        .arg(out)
-        .stdout(Stdio::null())
-        .status()
-        .map_err(|e| format!("{}: {e}", sweep.needle().display()))?;
-    let _ = std::fs::remove_file(&empty);
-    if !st.success() || !out.exists() {
-        return Err(format!("needle whistle build of {} failed", out.display()));
-    }
-    Ok(())
+    sweep.build_cact(None, out)
 }
 
 pub fn run_sweep(
@@ -218,15 +181,13 @@ fn run_one(
     eval: &Evaluator,
     ctl: &Arc<Control>,
 ) -> Result<(), String> {
-    let resume = dir.join("state.msgpack").exists();
+    let resume = dir.join("state.safetensors").exists();
     let config = sweep.trainer_config(run);
     std::fs::write(
         dir.join("config.json"),
         serde_json::to_string_pretty(&config).unwrap_or_default(),
     )
     .map_err(|e| e.to_string())?;
-    // The exact trainer this run used, next to its results.
-    std::fs::write(dir.join("whistle_train.py"), TRAINER).map_err(|e| e.to_string())?;
     append_event(
         dir,
         json!({"event": "status", "status": "running", "resume": resume, "evaluates": eval.checkpoints,
@@ -234,10 +195,12 @@ fn run_one(
     );
     ctl.say(format!("training {}", run.name));
 
-    let mut cmd = Command::new(&sweep.python);
-    cmd.arg("-I")
-        .arg(dir.join("whistle_train.py"))
-        .arg(dir.join("config.json"));
+    // The trainer is this program (`whistle-train train`), in a process of
+    // its own: a CUDA failure can't take the dashboard and evaluator with it.
+    let exe =
+        std::env::current_exe().map_err(|e| format!("cannot find whistle-train itself: {e}"))?;
+    let mut cmd = Command::new(&exe);
+    cmd.arg("train").arg(dir.join("config.json"));
     if resume {
         cmd.arg("--resume");
     }
@@ -247,7 +210,7 @@ fn run_one(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("{}: {e}", sweep.python.display()))?;
+        .map_err(|e| format!("{}: {e}", exe.display()))?;
     ctl.child.store(child.id() as i32, Ordering::SeqCst);
 
     let (tx, rx) = channel::<String>();
@@ -273,12 +236,7 @@ fn run_one(
                 use std::io::Write;
                 let _ = writeln!(f, "{line}");
             }
-            // Keep the TUI's log readable: absl/XLA log lines (`W1109 12:00:00...`)
-            // stay in stderr.txt.
-            let absl = line.len() > 5
-                && matches!(line.as_bytes()[0], b'I' | b'W')
-                && line.as_bytes()[1..5].iter().all(u8::is_ascii_digit);
-            if !line.trim().is_empty() && !absl {
+            if !line.trim().is_empty() {
                 append_event(&dir2, json!({"event": "stderr", "msg": line}));
             }
         }
@@ -361,25 +319,15 @@ fn run_one(
         if sweep.build {
             ctl.say(format!("building tuned_{}.cact", run.name));
             let cact = dir.join(format!("tuned_{}.cact", run.name));
-            let ok = Command::new(sweep.needle())
-                .args(["whistle", "build", "--lora"])
-                .arg(&best)
-                .arg("--out")
-                .arg(&cact)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-            if ok {
-                append_event(
+            match sweep.build_cact(Some(&best), &cact) {
+                Ok(()) => append_event(
                     dir,
                     json!({"event": "built", "path": cact.display().to_string()}),
-                );
-            } else {
-                append_event(
+                ),
+                Err(e) => append_event(
                     dir,
-                    json!({"event": "log", "msg": "needle whistle build failed"}),
-                );
+                    json!({"event": "log", "msg": format!("building {} failed: {e}", cact.display())}),
+                ),
             }
         }
     }
